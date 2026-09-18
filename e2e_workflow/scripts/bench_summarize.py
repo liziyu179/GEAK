@@ -154,6 +154,14 @@ def from_runs(args):
         # which one this leg actually took.
         summary["requested_rounds"] = requested
         summary["successful_rounds"] = len(tps)
+        # How many untimed full rounds preceded these. Part of the protocol, not
+        # a detail: a leg warmed twice is not comparable to one warmed once, and
+        # without this the two look identical in the record.
+        try:
+            summary["outer_warmup_rounds"] = int(
+                os.environ.get("BENCH_OUTER_WARMUP_ROUNDS") or 1)
+        except ValueError:
+            summary["outer_warmup_rounds"] = 1
         # Samples from ONE server bound client noise; boot-to-boot variance needs isolated_server.
         summary["dispersion_basis"] = "within_server_rounds"
         tail += (f"status={summary['status']} "

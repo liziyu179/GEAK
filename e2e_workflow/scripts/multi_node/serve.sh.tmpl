@@ -1,0 +1,64 @@
+# Per-rank server launch, rendered by `mn.py launch` and executed ON the target
+# node by a pinned Ray task.
+#
+# FRAMEWORK-AGNOSTIC ON PURPOSE. Everything below is a fact about the NODE:
+# which NIC, which master, where the logs go. HOW to start a server belongs to
+# the backend adapter (adapters/sglang.sh, adapters/vllm.sh) and WHAT config to
+# serve belongs to the recipe, so both arrive from outside instead of being
+# restated here. A copy of the launch line in this file would mean a second
+# framework needs a second copy of the whole file, and the two would drift.
+#
+# Placeholders are all mandatory: `mn.py launch` refuses to launch if any survives
+# the render, so a renamed one fails loudly instead of serving a config nobody
+# asked for.
+set -e
+
+# The NIC must be discovered where the process will actually run. Interface
+# names differ between these boxes, and Ray's NodeManagerAddress is whatever the
+# node registered with -- not necessarily the address the collectives should use.
+CLUSTER_IF=
+CLUSTER_IP=
+while read -r _ ifname _ addr _; do
+  ifname="${ifname%:}"
+  ipaddr="${addr%%/*}"
+  case "$ifname" in lo|docker0|br-*|veth*|virbr*) continue ;; esac
+  if [ -z "$CLUSTER_IF" ]; then CLUSTER_IF="$ifname"; CLUSTER_IP="$ipaddr"; fi
+  case "$ipaddr" in __CLUSTER_SUBNET__*) CLUSTER_IF="$ifname"; CLUSTER_IP="$ipaddr"; break ;; esac
+done < <(ip -4 -o addr show)
+if [ -z "$CLUSTER_IF" ]; then
+  echo "!!! no usable IPv4 interface on this node" >&2
+  exit 1
+fi
+export NCCL_SOCKET_IFNAME="$CLUSTER_IF"
+export GLOO_SOCKET_IFNAME="$CLUSTER_IF"
+export MASTER_ADDR=__MASTER__
+
+# Both the log and the profile dir live on the shared mount, so rank1's output
+# lands where the benchmark host can read it with no copy-back step. `mn.py launch`
+# proves the mount really is shared before getting here.
+mkdir -p "$(dirname __LOG__)" __PROFILE_DIR__
+echo "mn-launch id=__LAUNCH_ID__ rank=__RANK__ if=$CLUSTER_IF ip=$CLUSTER_IP master=$MASTER_ADDR log=__LOG__"
+
+# The env contract bench_e2e.sh gives a backend adapter, reproduced for one rank.
+# GPU is the PER-NODE device list: once the TP group spans machines, that is the
+# only meaning a device list can have.
+export MODEL=__MODEL__ TP=__TP__ GPU=__GPU__ MEM_FRACTION=__MEM_FRACTION__
+export HOST=0.0.0.0 PORT=__PORT__ BASE_URL="http://__MASTER__:__PORT__"
+export LOG=__LOG__ PROFILE_DIR=__PROFILE_DIR__
+export OVERLAY_PYTHONPATH=__OVERLAY__ PYTHONPATH=__PYTHONPATH__
+export EXTRA_ENV="__EXTRA_ENV__"
+# Same layering as adapters/launchers/magpie.sh: the recipe is the BASE layer and
+# GEAK's accepted flags come LATER, so a swept flag wins any conflict by argparse
+# last-wins and nothing GEAK chose can be displaced by the recipe.
+export EXTRA_SERVER_ARGS="__RECIPE_ARGS__ __EXTRA_ARGS__"
+# The adapter contract. Here it also gives the rank its own process group, so a
+# reap aimed at the server cannot take this script's group with it.
+export SERVER_LAUNCH_PREFIX=setsid
+
+# HOW this framework starts a server, and how it says "I am rank i of n".
+. "__ADAPTER__"
+# Appended LAST because it is structural, not tunable: a sweep must not be able
+# to change which rank this process is.
+EXTRA_SERVER_ARGS="$EXTRA_SERVER_ARGS $(adapter_dist_args __RANK__ __NNODES__ "$MASTER_ADDR" __DIST_PORT__)"
+adapter_launch
+echo STARTED_PID=$SERVER_PID

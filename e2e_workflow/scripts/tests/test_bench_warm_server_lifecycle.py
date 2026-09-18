@@ -297,6 +297,71 @@ class BenchWarmServerLifecycleTest(unittest.TestCase):
         self.assertEqual(summary["requested_rounds"], 1)
         self.assertIn("Unknown MEASUREMENT_PURPOSE", proc.stderr)
 
+    # ---- BENCH_OUTER_WARMUP_ROUNDS ----------------------------------------
+    # One warmup round is the protocol, but it assumes the server reaches steady
+    # state in one pass. Measured otherwise on DeepSeek-V4-Flash TP16 DP2 across
+    # two nodes: the first timed round came in 34% below the next two (which
+    # agreed within 2.7%), so the reported spread described the warm-up instead
+    # of the server. These pin the extra rounds as UNTIMED and RECORDED -- a leg
+    # warmed twice is not comparable to one warmed once.
+
+    def test_default_is_still_one_warmup_round(self):
+        _, summary, events = self.run_bench(purpose="validation")
+        benches = [e for e in events if e["event"] == "bench"]
+        self.assertEqual([e["nump"] for e in benches], [7, 7])
+        self.assertEqual(summary["outer_warmup_rounds"], 1)
+
+    def test_extra_warmup_rounds_are_untimed_and_recorded(self):
+        _, summary, events = self.run_bench(
+            purpose="validation", BENCH_OUTER_WARMUP_ROUNDS=2)
+        # Two FULL warmups (NUM_PROMPTS, not CONC) then the timed round.
+        benches = [e for e in events if e["event"] == "bench"]
+        self.assertEqual([e["nump"] for e in benches], [7, 7, 7])
+        # Only the third call is timed: calls 1 and 2 are discarded.
+        self.assertEqual(summary["all_throughput"], [300.0])
+        self.assertEqual(summary["outer_warmup_rounds"], 2)
+        # Still ONE server for the whole leg.
+        self.assertEqual(sum(e["event"] == "launch" for e in events), 1)
+
+    def test_extra_warmup_rounds_do_not_change_the_timed_round_count(self):
+        _, summary, events = self.run_bench(
+            purpose="search", repeats=3, BENCH_OUTER_WARMUP_ROUNDS=2)
+        benches = [e for e in events if e["event"] == "bench"]
+        self.assertEqual(len(benches), 5)          # 2 warmups + 3 timed
+        self.assertEqual(summary["all_throughput"], [300.0, 400.0, 500.0])
+        self.assertEqual(summary["requested_rounds"], 3)
+        self.assertEqual(summary["successful_rounds"], 3)
+
+    def test_a_failed_extra_warmup_round_invalidates_the_leg(self):
+        """A failed warmup means the timed rounds would not be warm -- the same
+        hard stop the first warmup already had, applied to every round."""
+        proc, summary, events = self.run_bench(
+            purpose="validation", expect_rc=2, FAIL_CALLS="2",
+            BENCH_OUTER_WARMUP_ROUNDS=2)
+        self.assertIn("outer warmup failed", proc.stderr)
+        self.assertIsNone(summary)
+        self.assertEqual(len([e for e in events if e["event"] == "bench"]), 2)
+
+    def test_the_short_legacy_warmup_is_unaffected(self):
+        """The knob is a warm_server concept; legacy keeps its single short
+        CONC-prompt warmup even if the knob is set."""
+        out_dir = os.path.join(self.tmp, "out_legacy_knob")
+        env = dict(os.environ)
+        env.update(
+            ADAPTER=self.adapter, BACKEND="fake",
+            MODEL=os.path.join(self.tmp, "model"), OUT_DIR=out_dir,
+            EVENT_LOG=self.events, CALL_COUNTER=self.counter,
+            GEAK_REPEAT_MODE="legacy", NUM_PROMPTS="7", CONC="3", PROFILE="0",
+            REPEATS="1", REUSE_SERVER="0", SERVING_GPU_LOCK_DISABLE="1",
+            SERVER_STOP_GRACE_S="0", BENCH_OUTER_WARMUP_ROUNDS="3",
+        )
+        proc = subprocess.run(
+            [BASH, BENCH], env=env, capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        benches = [e for e in self.read_events() if e["event"] == "bench"]
+        self.assertEqual([e["nump"] for e in benches], [3, 7])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

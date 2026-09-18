@@ -82,6 +82,18 @@ PY
 
 adapter_health() { curl -sf "${BASE_URL}/health" >/dev/null 2>&1; }
 
+# ---- multi-node (read by adapters/launchers/multinode.sh) ----
+# vllm's process model differs from sglang's: with the ray executor ONE `vllm
+# serve` on the head node places workers on the other nodes itself, so there is
+# no per-rank launch to do and no node-rank to pass. Declaring that here is what
+# keeps the launcher framework-agnostic -- it reads the mode instead of assuming
+# sglang's. The launcher currently implements per_rank only and refuses this
+# mode with a pointer to what is missing, which is the honest state: the path
+# below has not been run on a real vllm multi-node rig.
+adapter_dist_mode() { echo head_only; }
+# adapter_dist_args RANK NNODES MASTER DIST_PORT
+adapter_dist_args() { echo "--distributed-executor-backend ray"; }
+
 # adapter_bench NUM_PROMPTS MAX_CONC PROFILE_FLAG
 adapter_bench() {
   local NUMP="$1" MAXC="$2" PROF="${3:-0}"

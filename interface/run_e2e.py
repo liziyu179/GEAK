@@ -388,6 +388,34 @@ def _targeting_shape(h: dict) -> tuple[int, int, str]:
     return obs_isl, obs_osl, "agentx_observed"
 
 
+def _multinode_topology(h: dict, tp: int) -> tuple[int, int]:
+    """Resolve (nodes, gpus_per_node) from the handoff.
+
+    Stated node count wins; otherwise the run is single-host, because guessing
+    "tp=16 must mean two boxes" would turn a wrong tp on a 16-GPU host into a
+    silent distributed launch. gpus_per_node defaults to tp/nodes -- the only
+    split under which a TP group fills the machines it was given.
+    """
+    nodes = _int_or_none(h.get("nodes") or h.get("nnodes"), "handoff.nodes") or 1
+    if nodes < 1:
+        nodes = 1
+    stated = _int_or_none(h.get("gpus_per_node"), "handoff.gpus_per_node") or 0
+    if stated > 0:
+        gpus_per_node = stated
+    elif nodes > 1 and tp % nodes == 0:
+        gpus_per_node = tp // nodes
+    else:
+        gpus_per_node = tp
+    if nodes > 1 and gpus_per_node * nodes != tp:
+        # Not fatal: a caller may deliberately serve tp<world on a pinned pair.
+        # Silence would be, since the device list below is derived from it.
+        sys.stderr.write(
+            f"!!! handoff topology: nodes={nodes} x gpus_per_node={gpus_per_node} "
+            f"!= tp={tp}; serving tp={tp} on the stated node set.\n"
+        )
+    return nodes, gpus_per_node
+
+
 def map_args(h: dict, timeout_s: int | None = None) -> dict:
     workload = h.get("workload") or {}
     tp = int(h.get("tp", 1) or 1)
@@ -427,9 +455,19 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
         initial_overlay = ":".join(
             dict.fromkeys(part for part in overlay_parts if part)
         )
+    # Multi-node topology. nodes=1 (the default) leaves every path below
+    # byte-identical to the single-host behaviour.
+    nodes, gpus_per_node = _multinode_topology(h, tp)
     # gpu_ids is the optimization-parallelism pool AND the serving device set.
     # Default to 0..tp-1 so serving honours the requested tensor-parallel size.
-    gpu_ids = h.get("gpu_ids") or ",".join(str(i) for i in range(max(tp, 1)))
+    # Across nodes that default is wrong in a way that does not announce itself:
+    # TP=16 on two 8-GPU boxes would ask for devices 0..15 on EVERY node, which
+    # names eight cards that do not exist there. The per-node device count is the
+    # only meaning $GPU can have once the TP group spans machines -- it is what
+    # the GPU allow-list is checked against and what the serving lock is keyed on.
+    gpu_ids = h.get("gpu_ids") or ",".join(
+        str(i) for i in range(max(gpus_per_node if nodes > 1 else tp, 1))
+    )
     target_isl, target_osl, shape_provenance = _targeting_shape(h)
     ps_args = {
         "model_path": h["model_path"],
@@ -473,6 +511,11 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
         "apply_to_original": "true",
         "exp_root": h["exp_root"],
     }
+    # Only surfaced when the run really is distributed, so a single-host args
+    # object is unchanged and the workflow keeps its existing defaults.
+    if nodes > 1:
+        ps_args["nodes"] = nodes
+        ps_args["gpus_per_node"] = gpus_per_node
     if effective is not None:
         ps_args["effective_config_digest"] = effective.digest
     # Forward the orchestrator's HARD wall-clock budget (the same timeout_s this
@@ -1381,6 +1424,100 @@ def _magpie_script_from_recipe(h: dict) -> str:
     return ""
 
 
+def _serving_topology() -> dict:
+    """The node set the server was actually served on, read back from the pin.
+
+    Taken from mn_state.json rather than from the handoff: the handoff states an
+    intent, the pin records the machines that served, and when they differ the
+    second one is what produced the number.
+    """
+    nodes = _int_or_none(os.environ.get("GEAK_MN_NODES"), "GEAK_MN_NODES") or 1
+    topology = {
+        "nodes": nodes,
+        "gpus_per_node": _int_or_none(
+            os.environ.get("GEAK_MN_GPUS_PER_NODE"), "GEAK_MN_GPUS_PER_NODE"
+        ) or None,
+    }
+    if nodes <= 1:
+        return topology
+    state_path = os.environ.get("GEAK_MN_STATE", "")
+    state = _read_json(Path(state_path)) if state_path else {}
+    if state:
+        topology.update({
+            "pinned_hosts": [
+                str(n.get("hostname", "")).split(".")[0] for n in state.get("nodes", [])
+            ],
+            "master_ip": state.get("master_ip"),
+            "pinned_at": state.get("pinned_at"),
+            "shared_fs": state.get("shared_fs"),
+        })
+    return topology
+
+
+def apply_multinode(h: dict) -> dict:
+    """Export the cluster handoff the multi-node launcher reads, or refuse.
+
+    GEAK does not create, resize or tear down the cluster -- the caller hands one
+    over, exactly as Hyperloom's multi-node path does. What arrives here is:
+
+      * shared_fs    the filesystem every node mounts. MANDATORY, because it is
+                     what makes "ship the overlay to all ranks" and "collect the
+                     traces back" non-problems: one path, visible everywhere.
+      * ray_address  how to reach the cluster manager ("auto" = the local head).
+      * ports        the serving port and the dist-init port, pinned so the
+                     client, the health probe and every rank agree on one number.
+      * service_url  only for attaching to a service the caller already started.
+
+    Refusing when shared_fs is missing is the point: the alternative is a run
+    that launches, measures, and reports a speedup for an overlay that only ever
+    reached rank0 -- a wrong number that looks exactly like a right one.
+    """
+    tp = int(h.get("tp", 1) or 1)
+    nodes, gpus_per_node = _multinode_topology(h, tp)
+    mn = h.get("multinode") if isinstance(h.get("multinode"), dict) else {}
+    info = {"nodes": nodes, "gpus_per_node": gpus_per_node}
+    if nodes <= 1:
+        return info
+
+    shared = str(mn.get("shared_fs") or os.environ.get("GEAK_MN_EXT_SHARED_FS", "")).strip()
+    if not shared:
+        raise SystemExit(
+            f"!!! handoff asks for nodes={nodes} but names no shared filesystem.\n"
+            "    Set multinode.shared_fs (or GEAK_MN_EXT_SHARED_FS) to a path every\n"
+            "    node mounts. Without it the authored overlay reaches only the node\n"
+            "    GEAK runs on, the other ranks serve stock code, and the run still\n"
+            "    reports a speedup -- for a kernel half the ranks never loaded."
+        )
+    os.environ["GEAK_MN_EXT_SHARED_FS"] = shared
+    os.environ["GEAK_MN_NODES"] = str(nodes)
+    os.environ["GEAK_MN_GPUS_PER_NODE"] = str(gpus_per_node)
+
+    service_url = str(mn.get("service_url") or os.environ.get("GEAK_MN_EXT_SERVICE_URL", "")).strip()
+    if service_url:
+        os.environ["GEAK_MN_EXT_SERVICE_URL"] = service_url
+    for key, env in (("ray_address", "GEAK_MN_RAY_ADDRESS"),
+                     ("serve_port", "GEAK_MN_SERVE_PORT"),
+                     ("dist_init_port", "GEAK_MN_DIST_INIT_PORT"),
+                     ("cluster_subnet", "GEAK_MN_CLUSTER_SUBNET")):
+        # No `dp` here on purpose: data-parallel width is an ordinary server flag
+        # in whatever the framework calls it, so it rides the normal server-args
+        # channel. Only facts the launcher itself needs -- which cluster, which
+        # ports, which fabric -- belong in this list.
+        val = str(mn.get(key) or "").strip()
+        if val:
+            os.environ[env] = val
+    # The pin itself lives on the shared mount, so every process in the run --
+    # this driver, each bench_e2e.sh, the supervisor -- reads the same one.
+    os.environ.setdefault("GEAK_MN_STATE", str(Path(shared) / "mn_state.json"))
+    info.update({
+        "shared_fs": shared,
+        "service_url": service_url,
+        "state": os.environ["GEAK_MN_STATE"],
+        "state_exists": Path(os.environ["GEAK_MN_STATE"]).is_file(),
+    })
+    return info
+
+
 def apply_bench_launcher(h: dict) -> str:
     """Align the SERVER LAUNCH recipe with the external orchestrator (Magpie).
 
@@ -1440,12 +1577,25 @@ def apply_bench_launcher(h: dict) -> str:
         os.environ["MAGPIE_LAUNCH_SCRIPT"] = script
         os.environ["MAGPIE_LAUNCH_SCRIPT_SOURCE"] = source
 
+    nodes, _ = _multinode_topology(h, int(h.get("tp", 1) or 1))
     if requested and requested != "auto":
         launcher = requested
+    elif nodes > 1:
+        # Not a preference: the native launch and Magpie's script both start ONE
+        # local server, so on a multi-node handoff they would serve a TP group
+        # that fits on one box and measure a completely different config from the
+        # one requested. There is no fallback worth having here.
+        launcher = "multinode"
     elif script and backend in _MAGPIE_BACKENDS:
         launcher = "magpie"
     else:
         launcher = "native"
+    if nodes > 1 and launcher != "multinode":
+        sys.stderr.write(
+            f"!!! handoff asks for nodes={nodes} but bench_launcher='{launcher}' was\n"
+            "    requested explicitly. That launcher starts a single local server;\n"
+            "    the run will measure a single-node config.\n"
+        )
     os.environ["BENCH_LAUNCHER"] = launcher
     if int(h.get("schema_version", 1) or 1) >= 2 and isinstance(
         h.get("baseline_env_spec"), dict
@@ -3251,6 +3401,10 @@ def normalize_result(h: dict, wf: dict) -> dict:
         "launch_script": os.environ.get("MAGPIE_LAUNCH_SCRIPT", ""),
         "launch_script_source": os.environ.get("MAGPIE_LAUNCH_SCRIPT_SOURCE", ""),
         "recipe_aligned_with_orchestrator": recipe_aligned,
+        # Topology belongs in the provenance for the same reason the launcher
+        # does: a tok/s figure from 16 GPUs across two boxes is not comparable
+        # to one from 8, and nothing else in this file would say which it was.
+        "topology": _serving_topology(),
         "baseline": _serving_stack_signals(eval_dir / "baseline" / "server.log"),
         "validation_base": _serving_stack_signals(
             eval_dir / "validation" / "base" / "server.log"
@@ -6588,6 +6742,9 @@ def main(argv: list[str]) -> int:
     os.environ["GEAK_EVAL_DIR"] = ps_args["eval_dir"]
     _publish_protected_pgids()
     bench_client = apply_bench_client(h)
+    # Before the launcher: its auto-selection depends on the node count, and the
+    # launcher adapter reads the GEAK_MN_* env this exports.
+    multinode = apply_multinode(h)
     bench_launcher = apply_bench_launcher(h)
     workload_exports = apply_workload_spec(h)
     workload_preflight = agentx_preflight(h)
@@ -6600,6 +6757,7 @@ def main(argv: list[str]) -> int:
                           "bench_launcher": bench_launcher,
                           "workload_spec_exports": workload_exports,
                           "agentx_preflight_problems": workload_preflight,
+                          "multinode": multinode,
                           "magpie_launch_script": os.environ.get("MAGPIE_LAUNCH_SCRIPT", ""),
                           "magpie_launch_script_source": os.environ.get("MAGPIE_LAUNCH_SCRIPT_SOURCE", ""),
                           "recipe_env_file": os.environ.get("RECIPE_ENV_FILE", ""),

@@ -1139,7 +1139,8 @@ exactly these in its env:
     BACKEND=${BACKEND} TP=${SERVING_TP} GPU=${SERVING_GPU}
 NEVER change TP or the GPU set between the baseline, a candidate, and validation — a TP/GPU mismatch
 makes every delta meaningless. (If SERVING_TP=1, GPU=${SERVING_GPU} is a single id; if SERVING_TP>1 it
-is a comma-separated set spanning exactly TP GPUs.)
+is a comma-separated set. Use it VERBATIM and never re-derive it from TP: the two agree on a single
+host, but when the TP group spans several hosts this names the ids of ONE host -- all any host has.)
 GPU_IDS=${GPU_IDS} is a SEPARATE OPTIMIZATION-PARALLELISM pool: it is used ONLY for single-GPU isolated
 work (op_bench bake-offs, shape-capture, the recursive kernel layer), where each task pins ONE id from
 the pool via GPU_ID. Do NOT use the serving TP/GPU set for that isolated work, and do NOT use a single
