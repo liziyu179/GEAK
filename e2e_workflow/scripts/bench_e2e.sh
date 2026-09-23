@@ -320,6 +320,12 @@ if [ "$BENCH_LAUNCHER" != "native" ]; then
   # them (e.g. fall back when the external recipe/script is unavailable).
   copy_function adapter_launch adapter_launch_native
   copy_function adapter_health adapter_health_native
+  # ...and the profile window: a launcher that spreads the server over several
+  # HOSTS has to wait for every rank's trace to land, but the trace REQUEST
+  # (activities, record_shapes, with_stack -- tuned per backend) must stay
+  # owned by the backend adapter. So the launcher extends the wait by
+  # delegating the request to the native window rather than restating it.
+  copy_function adapter_profile_window adapter_profile_window_native
   # shellcheck disable=SC1090
   source "$LAUNCHER_ADAPTER"   # MUST redefine adapter_launch (server lifecycle)
   if ! declare -F adapter_launch >/dev/null; then
@@ -447,6 +453,20 @@ NUM_WARMUPS=${NUM_WARMUPS:-$(( CONC < 8 ? CONC : 8 ))}
 RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO:-0}
 REPEATS=${REPEATS:-3}                 # repeat the bench this many times; report median + spread
 SEED=${SEED:-0}                       # fixed seed for reproducibility / parity
+# Full untimed rounds before the timed ones (warm_server only; the short legacy
+# warmup is always one). 1 is the Hyperloom protocol and stays the default.
+#
+# Raise it only for a stack that demonstrably has not reached steady state after
+# one round, and say so in the run's notes -- the number of warmup rounds is part
+# of the measurement protocol, so two legs compared against each other must use
+# the same value (it is recorded in bench_summary.json for that reason). Measured
+# case: DeepSeek-V4-Flash TP16 DP2 over two nodes, ISL/OSL 1024, CONC 8 --
+# 95.3 / 147.8 / 143.8 tok/s across three timed rounds after ONE warmup round.
+# The first timed round is 34% below the next two, which are within 2.7% of each
+# other, so a single warmup left cost in the first round and the reported spread
+# (36.5%) described the warm-up rather than the server.
+BENCH_OUTER_WARMUP_ROUNDS=${BENCH_OUTER_WARMUP_ROUNDS:-1}
+export BENCH_OUTER_WARMUP_ROUNDS   # bench_summarize.py records it with the number
 
 # ---- client trust-remote-code (general, model-agnostic) ----
 # The benchmark CLIENT loads the model's tokenizer; for custom-tokenizer models
@@ -737,19 +757,28 @@ if [ "${GEAK_ISOLATED_REPLICA:-0}" = "1" ] \
   echo ">>> Skipping outer warmup (compute-warm/cache-cold isolated replica) ..."
 else
   _warmup_prompts="$CONC"
+  _warmup_rounds=1
   if [ "${BENCH_OUTER_WARMUP_FULL_ROUND:-0}" = "1" ]; then
     _warmup_prompts="$NUM_PROMPTS"
-    echo ">>> Warmup full round (prompts=$_warmup_prompts) ..."
-  else
-    echo ">>> Warmup round ..."
+    _warmup_rounds="$BENCH_OUTER_WARMUP_ROUNDS"
   fi
-  if ! adapter_bench "$_warmup_prompts" "$CONC" 0 >/dev/null 2>&1; then
+  _w=1
+  while [ "$_w" -le "$_warmup_rounds" ]; do
     if [ "${BENCH_OUTER_WARMUP_FULL_ROUND:-0}" = "1" ]; then
-      echo "!!! Full outer warmup failed; this measurement is invalid" \
-           "(the timed rounds would not be warm)." >&2
-      exit 2
+      echo ">>> Warmup full round (prompts=$_warmup_prompts)" \
+           "$([ "$_warmup_rounds" -gt 1 ] && echo "[$_w/$_warmup_rounds] ")..."
+    else
+      echo ">>> Warmup round ..."
     fi
-  fi
+    if ! adapter_bench "$_warmup_prompts" "$CONC" 0 >/dev/null 2>&1; then
+      if [ "${BENCH_OUTER_WARMUP_FULL_ROUND:-0}" = "1" ]; then
+        echo "!!! Full outer warmup failed; this measurement is invalid" \
+             "(the timed rounds would not be warm)." >&2
+        exit 2
+      fi
+    fi
+    _w=$(( _w + 1 ))
+  done
 fi
 # the warmup line should not pollute the timed results
 : > "$RESULT_JSONL"

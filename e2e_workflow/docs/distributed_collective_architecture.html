@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>GEAK 跨机 collective 优化 — 改在哪一层</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 44px;
+    background: #fff; color: #1b2733;
+    font: 15px/1.5 "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; }
+
+  h1 { font-size: 27px; margin: 0 0 22px; letter-spacing: .3px; }
+  h1 em { font-style: normal; color: #2a9d5c; }
+
+  h2 { font-size: 17px; margin: 34px 0 14px; }
+
+  .legend { display: flex; gap: 26px; margin-bottom: 22px;
+            font-size: 13px; color: #7b8a99; }
+  .key { display: inline-flex; align-items: center; gap: 8px; }
+  .swatch { width: 28px; height: 14px; border-radius: 3px; border: 1.5px solid; }
+  .s-keep { background: #f1f4f7; border-color: #c3ced9; }
+  .s-seam { background: #fff3e0; border-color: #e8a33d; }
+  .s-new  { background: #e6f6ec; border-color: #2a9d5c; }
+
+  .layer { display: grid; grid-template-columns: 158px 1fr; gap: 20px;
+           align-items: center; }
+  .lname { text-align: right; font-weight: 700; font-size: 15px; }
+  .lname s { display: block; text-decoration: none; font-weight: 400;
+             font-size: 12px; color: #9aa7b4; margin-top: 2px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+  .arrow { grid-column: 2; color: #cfd8e0; font-size: 13px;
+           line-height: 1; padding: 7px 0 7px 26px; }
+
+  .chip { border: 1.5px solid; border-radius: 7px; padding: 8px 13px;
+          font-size: 14px; white-space: nowrap; }
+  .keep { background: #f1f4f7; border-color: #c3ced9; color: #46586a; }
+  .seam { background: #fff3e0; border-color: #e8a33d; color: #8a5200; }
+  .new  { background: #e6f6ec; border-color: #2a9d5c; color: #16643a;
+          font-weight: 700; }
+  .big  { font-size: 16px; padding: 11px 18px; box-shadow: 0 2px 9px rgba(42,157,92,.2); }
+  .m { font-family: Consolas, monospace; }
+  .slot { color: #2a9d5c; font-size: 12px; font-weight: 700; }
+  .slot.amber { color: #8a5200; }
+  .slot.grey { color: #9aa7b4; }
+
+  .why { margin-top: 9px; font-size: 12.5px; color: #7b8a99;
+         display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
+  .why b { color: #46586a; font-weight: 600; }
+  .w { border: 1px solid #cfe6d8; background: #f4fbf7; color: #16643a;
+       border-radius: 5px; padding: 3px 8px; }
+  .w.hi { border-color: #2a9d5c; font-weight: 700; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 8px 11px; border-bottom: 1px solid #eceff2;
+           vertical-align: top; }
+  th { color: #7b8a99; font-weight: 600; font-size: 12.5px; white-space: nowrap; }
+  td.f { white-space: nowrap; font-family: Consolas, monospace; font-size: 12.5px; color: #46586a; }
+  td.n { white-space: nowrap; text-align: right; font-family: Consolas, monospace; color: #8b98a5; }
+  tr.add td.f { color: #16643a; font-weight: 700; }
+  tr.star td { background: #fffaf1; }
+
+  .bottom { margin-top: 26px; border-top: 2px solid #eceff2; padding-top: 16px;
+            font-size: 15.5px; }
+  .bottom b { color: #14803c; }
+  .nums { margin-top: 9px; color: #8b98a5; font-size: 13px; }
+  .nums span { margin-right: 20px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>跨机 collective 优化：只加了一件事 —— <em>「一条腿可以跨 rank」</em></h1>
+
+  <div class="legend">
+    <span class="key"><span class="swatch s-keep"></span>原样未动</span>
+    <span class="key"><span class="swatch s-seam"></span>既有文件 · 接缝改动</span>
+    <span class="key"><span class="swatch s-new"></span>新增</span>
+  </div>
+
+  <div class="layer">
+    <div class="lname">Role / 阶段<s>GEAK 的大脑</s></div>
+    <div class="row">
+      <span class="chip keep">profiler</span>
+      <span class="chip keep">system_architect</span>
+      <span class="chip keep">config_tuner</span>
+      <span class="chip keep">kernel_extractor</span>
+      <span class="chip keep">kernel_lane</span>
+      <span class="chip keep">e2e_integrator</span>
+      <span class="chip keep">director</span>
+      <span class="slot">← 0 个新 role</span>
+    </div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="layer">
+    <div class="lname">e2e_workflow.js<s>phase 与队列</s></div>
+    <div>
+      <div class="row">
+        <span class="chip keep">Milestone 环　<span class="m">extract → kernel_lane → integrate</span></span>
+        <span class="chip seam">＋10 行提示词（＋20 可选门禁）</span>
+        <span class="slot amber">← 0 个新 phase</span>
+      </div>
+      <div class="why">
+        <b>为什么几乎不用改：Milestone 环对「候选是什么」是泛型的。</b>
+        <span class="w">队列无 guard</span>
+        <span class="w">候选字段整体透传</span>
+        <span class="w">checkpoint 已在写</span>
+        <span class="w hi">剩下的只有两池不变量那段文字</span>
+      </div>
+    </div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="layer">
+    <div class="lname">两腿测量<s>谁快</s></div>
+    <div>
+      <div class="row">
+        <span class="chip keep">measure_legs ／ ABBA ／ median</span>
+        <span class="chip keep">run_correctness ／ correct()</span>
+        <span class="chip new big">★ _run_leg 分派</span>
+        <span class="slot">← 全链只有它知道 rank</span>
+      </div>
+      <div class="why">
+        <b>为什么这里是唯一的缝：只有 <span class="m">_run_leg</span> 知道「一条腿 = 一个本地子进程」。</b>
+        <span class="w">ABBA 交错与 rank 数无关</span>
+        <span class="w">identity guard 无关</span>
+        <span class="w hi">腿的身份仍只由 PYTHONPATH 决定</span>
+      </div>
+    </div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="layer">
+    <div class="lname">一条腿怎么被拉起<s>和单算子同层</s></div>
+    <div>
+      <div class="row">
+        <span class="chip keep">单卡：<span class="m">Popen + start_new_session</span>　28 行</span>
+        <span class="chip new big">★ 16 rank：mn.py fanout</span>
+        <span class="chip new">rank_preamble.sh.inc</span>
+        <span class="slot">← 第六个子命令，不是新 launcher</span>
+      </div>
+      <div class="why">
+        <b>为什么单算子没有这一层：它的拉起就是 <span class="m">_run_leg</span> 里那 28 行 Popen，不需要「另一台机器」的概念。</b>
+        <span class="w">多 rank 只多三件事</span>
+        <span class="w">跨机 spawn</span>
+        <span class="w">NIC / MASTER 一致</span>
+        <span class="w">16 份 stdout 归一</span>
+        <span class="w hi">复用 pin / teardown / supervise / reap</span>
+      </div>
+    </div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="layer">
+    <div class="lname">serving 那条路<s>最终吞吐口径</s></div>
+    <div>
+      <div class="row">
+        <span class="chip keep">bench_e2e.sh</span>
+        <span class="chip keep">launchers/multinode.sh</span>
+        <span class="chip keep">adapters/sglang.sh</span>
+        <span class="chip keep">adapters/vllm.sh</span>
+        <span class="slot grey">← 全部 0 行，harness 不进这一层</span>
+      </div>
+      <div class="why">
+        <b>为什么 harness 不做成 backend adapter：<span class="m">bench_e2e.sh</span> 强制要 <span class="m">adapter_health</span>（curl $BASE_URL）+ <span class="m">adapter_bench</span>（跑 bench client），harness 两个都没有。</b>
+        <span class="w hi">BACKEND 的取值域不该被污染</span>
+      </div>
+    </div>
+  </div>
+  <div class="arrow">▼</div>
+
+  <div class="layer">
+    <div class="lname">硬件</div>
+    <div class="row">
+      <span class="chip keep">单卡隔离 op bench</span>
+      <span class="chip new">两机 16 rank 微基准</span>
+      <span class="chip keep">两机 TP16 serving A/B（最终口径）</span>
+    </div>
+  </div>
+
+  <h2>每个文件为什么要改</h2>
+  <table>
+    <tr><th style="width:27%">文件</th><th style="width:9%">行</th><th>原因</th></tr>
+
+    <tr class="add">
+      <td class="f">multi_node/rank_preamble.sh.inc</td>
+      <td class="n">＋27</td>
+      <td><b>新增，但是纯搬移</b>——从 <span class="m">serve.sh.tmpl</span> 的第 14–41 行整段搬出来：NIC 现探测、<span class="m">NCCL/GLOO_SOCKET_IFNAME</span>、<span class="m">MASTER_ADDR</span>、共享目录 mkdir。<b>这是唯一必须在目标机上执行、不能留在 driver 端的东西。</b>两个渲染方共用一份，因为 fabric 判定（真实掩码而非 /24 前缀）不允许有第二份拷贝。</td>
+    </tr>
+    <tr class="add">
+      <td class="f">tests/test_collective_harness.py</td>
+      <td class="n">＋457</td>
+      <td><b>新增。</b>一套单测对一个源模块，是这套代码的既有惯例；前四步验证不需要独占 GPU 就靠它。</td>
+    </tr>
+    <tr class="add">
+      <td class="f">knowledge/distributed_collective.md</td>
+      <td class="n">＋187</td>
+      <td><b>新增，全部教条集中在这里。</b>分布式 task 契约（<span class="m">cases.py</span> 形状、process group 冻结、oracle 定义为「同种子下与 RCCL 逐字节相等」、fallback 条件）＋ harness 契约 ＋ 已证伪杠杆清单（跨机 custom AR / QuickReduce / AR-norm 融合、overlap 的 −5.10%）。<b>放这里而不是塞进 role 文件</b>，是因为这套代码的分工就是 role 指向 knowledge（见 <span class="m">knowledge/shape_capture.md</span>）。不写进知识库，下一轮会重新花预算证一次。</td>
+    </tr>
+
+    <tr class="star">
+      <td class="f">scripts/harness_lib.py</td>
+      <td class="n">＋166 / −7</td>
+      <td><b>唯一的分派点。</b>只有 <span class="m">_run_leg</span> 假设一条腿是本地子进程。在这里按 <span class="m">meta.execution_model</span> 分流，它上面的 ABBA 交错 / median / identity guard 全部不动。<b>只有 time / oracle 需要 peer 才 fanout</b>；resolve / list 问的是「这条腿 import 了哪个文件」，是 overlay 的属性而不是拓扑的属性，让它们也去 16 卡集合会把 identity guard 押在一个活集群上。<br><b>实现时发现的一处比设计多出来的东西</b>：候选的正确性也不能在 unittest 进程里做 —— <span class="m">current_call</span> 需要 15 个 peer。所以 baseline / candidate 两边都在 fanout 下录 blob、事后逐 rank 比（<span class="m">distributed_random_outputs</span> ＋ <span class="m">check_random_vs_baseline_per_rank</span>，66 行）。<b>16 个 rank 全比，不只比 rank0</b> —— root 上对、非 root 上错正是 collective 的典型 bug。</td>
+    </tr>
+    <tr>
+      <td class="f">scripts/leg_runner.py</td>
+      <td class="n">＋95</td>
+      <td>加一个 distributed 前置：env → process group、barrier + 跨 rank 取 max、per-rank 落盘、候选预编译。<b>仍是同一个文件被两条腿执行</b>，所以「腿的身份只由 overlay 决定」这条不变量原样成立。</td>
+    </tr>
+    <tr class="star">
+      <td class="f">scripts/multi_node/mn.py</td>
+      <td class="n">＋273</td>
+      <td><span class="m">launch</span> 强制要 MODEL 且只会起服务。第六个子命令 <span class="m">fanout</span> 复用 pin / NIC / master / teardown / supervise / reap，只换掉「跑什么」：渲染 <span class="m">rank_preamble</span> ＋ 8 行尾巴（export RANK / WORLD_SIZE / MASTER_PORT、<span class="m">setsid</span> exec、<span class="m">echo STARTED_PID</span>）。那 8 行是常量字符串，不另开文件。做成子命令而不是新 launcher，是因为 supervise / reap 早就是这么做的。</td>
+    </tr>
+    <tr>
+      <td class="f">multi_node/serve.sh.tmpl</td>
+      <td class="n">＋3 / −27</td>
+      <td>头一段搬去 <span class="m">rank_preamble.sh.inc</span>，剩下的是 server 语义（MODEL / TP / PORT / BASE_URL / adapter 契约）。<b>纯搬移，<span class="m">shell/snippets/_dry_diff.py</span> 拿暂存区的旧模板渲染一遍再和现在的逐字节对账</b> —— 已验证：server 那条路除了 include 处两行注释，一个字节没变。</td>
+    </tr>
+    <tr>
+      <td class="f">scripts/tests/test_mn.py</td>
+      <td class="n">＋174</td>
+      <td><span class="m">fanout</span> 的用例：无 MODEL 也要能渲染、CMD 必填、占位符对账、teardown 仍在 spawn 之前。</td>
+    </tr>
+    <tr>
+      <td class="f">e2e_workflow.js</td>
+      <td class="n">＋10<br><span style="font-weight:400">（＋20 可选）</span></td>
+      <td><b>只有两池不变量那段提示词（1134–1154）。</b>它现在对所有 role 说「<span class="m">GPU_IDS</span> 只用于单卡隔离工作，起服务要显式 <span class="m">BENCH_LAUNCHER=native</span>」；collective harness 两者都不是，不加第三种情形 agent 会照教条给它一张卡加 <span class="m">native</span>。这段文字只存在于 JS 里（注入每个 role 的 prompt，就是为了漏不掉）。<br><b>其余全是 0 行</b>：队列无 guard（<span class="m">kernel_candidates.slice()</span>）、候选以 <span class="m">{...c}</span> 和 <span class="m">KERNEL: c</span> 整体透传给 extractor、accept 走 <span class="m">bankAccepted(acceptedKernels)</span> 于是 4901 行的 checkpoint 和 <span class="m">carryState</span> 都白得、66% 过 <span class="m">MILESTONE_MIN_PCT</span> 无压力。<br>可选的 20 行：把 wire-budget 门禁做成 JS 硬门——和 <span class="m">MILESTONE_MIN_PCT</span>（4587）、<span class="m">SWEEP_SCOPE</span> 同一套路，理由都是「不信 agent 会自我约束」。</td>
+    </tr>
+    <tr class="star">
+      <td class="f">roles/system_architect.md</td>
+      <td class="n">＋20</td>
+      <td><b>唯一「没有它这个功能就不存在」的 role 改动，而且不是加功能 —— 是撤一条禁令。</b>三句话各自都能把 collective 挡在 <span class="m">kernel_candidates</span> 之外：<span class="m">:59</span> head 车道范围是「GEMM or attention」；<span class="m">:67-72</span> comm 只能 emit 成 <span class="m">config_directions</span>，明写「no Tier-C rewrite」；<span class="m">:208-209</span> 给出理由「isolating an all-reduce to one rank leaves it with no peers, so <span class="m">extract_op</span> is not available」。<b>第三句是承重的 —— 它是个前提，而新 harness 正好让这个前提变成假的</b>（extract_op 可用了，只是不在一个 rank 上）。不改，架构师会继续<b>正确地</b>服从一条过期理由，候选永远产不出来，而且静默（同 wf2 那次 comm 车道被关死却报出 1.416× 的形状）。这 25 行 ＝ 改三句 ＋ 写准入（env 阶梯已尽、roof 已测）＋ 该候选的 <span class="m">ENGAGEMENT_CHECK</span>。</td>
+    </tr>
+    <tr>
+      <td class="f">roles/kernel_extractor.md</td>
+      <td class="n">＋8</td>
+      <td>只加一条指针：<span class="m">execution_model=distributed_collective</span> 时读 <span class="m">knowledge/distributed_collective.md</span>。契约本身不放 role 文件——833 行的 role 文件不该为一种算子涨 16%。</td>
+    </tr>
+    <tr>
+      <td class="f">docs/multi_node.md</td>
+      <td class="n">＋76</td>
+      <td><span class="m">fanout</span> 子命令和新 env 变量表 —— env 全表在这里，不在别处。</td>
+    </tr>
+  </table>
+
+  <div class="bottom">
+    <b>0 个新 role、0 个新 phase、0 个新 workflow js、0 个新 backend</b>——新增物收敛成一条抽象：<span class="m">execution_model</span> 落在 task / harness 契约上，而不是落成一条平行车道。<b>教条集中在一个新知识文件，代码改动集中在测量层那三处，role 只有一个必须动。</b>其余 role 不用改，是因为它们本来就是参数化的（<span class="m">e2e_integrator</span> 执行架构师给的 <span class="m">ENGAGEMENT_CHECK</span>）或本来就带对了条件（<span class="m">profiler</span> 的「禁 rewrite」只在 <span class="m">skew ≫ 3</span> 时触发）。下一个非单卡算子（all-to-all、reduce-scatter）只需要一个新的 <span class="m">cases.py</span>。
+    <div class="nums">
+      <span>新增 3 文件 / 671 行</span>
+      <span>修改 9 文件 / 825 行</span>
+      <span>含 631 行单测</span>
+      <span>编排层 10 行 · role 层 28 行</span>
+      <span>1244 个单测全绿（新增 41）</span>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

@@ -49,6 +49,70 @@ adapter_launch() {
 
 adapter_health() { curl -sf "${BASE_URL}/health" >/dev/null 2>&1; }
 
+# ---- multi-node (read by adapters/launchers/multinode.sh) ----
+# Only the launcher knows the values; only this file knows the spelling. Keeping
+# the two apart is what lets one launcher serve every framework.
+#
+# per_rank: sglang wants one server process per node, each told which rank it is.
+adapter_dist_mode() { echo per_rank; }
+# adapter_dist_args RANK NNODES MASTER DIST_PORT
+adapter_dist_args() { echo "--nnodes $2 --node-rank $1 --dist-init-addr $3:$4"; }
+
+# ---- prefill/decode disaggregation (also read by launchers/multinode.sh) ----
+# A DIFFERENT topology, not a wider version of the one above: each role is a
+# COMPLETE server, TP-closed inside its own node, and the two never join a
+# collective. They meet only where prefill hands finished KV pages to decode over
+# a transfer backend, and a load balancer in front makes the pair look like one
+# endpoint to the client. Hence no rank/world triple anywhere below -- passing one
+# would make each engine wait for a peer that is not coming.
+adapter_pd_mode() { echo pd_roles; }
+
+# adapter_pd_args ROLE BOOTSTRAP_PORT TRANSFER_BACKEND [IB_DEVICE]
+adapter_pd_args() {
+  local role="$1" boot="$2" backend="${3:-mooncake_tcp}" ib="${4:-}"
+  local out="--disaggregation-mode $role --disaggregation-transfer-backend $backend"
+  # The bootstrap registry is a PREFILL-side service. On decode the identically
+  # named flag would mean "the port the prefill side listens on", which decode
+  # already receives per request from the load balancer -- so setting it there
+  # states a second, unused source of truth that can only disagree.
+  [ "$role" = "prefill" ] && out="$out --disaggregation-bootstrap-port $boot"
+  # Left empty on purpose for the tcp transports: mooncake_tcp resolves the IB
+  # device to None itself, and naming a device that has no verbs provider is how
+  # you get an engine that starts and then cannot transfer.
+  [ -n "$ib" ] && out="$out --disaggregation-ib-device $ib"
+  echo "$out"
+}
+
+# adapter_pd_lb_launch HOST PORT PREFILL_URL BOOTSTRAP_PORT DECODE_URL
+#
+# sglang ships two load balancers behind one CLI: the Rust router (default) and
+# the FastAPI mini-LB (--mini-lb, which its own banner calls debug-only and which
+# forces the random policy). Both speak the same PD protocol, so the choice is
+# LB_EXTRA_ARGS' business, not this function's.
+#
+# --model-path is passed so the LB can answer /get_model_info and /v1/models
+# without having to interrogate a worker that may still be loading weights.
+adapter_pd_lb_launch() {
+  local host="$1" port="$2" purl="$3" boot="$4" durl="$5"
+  local bootarg=()
+  [ -n "$boot" ] && [ "$boot" != "none" ] && bootarg=("$boot")
+  # shellcheck disable=SC2086
+  ${SERVER_LAUNCH_PREFIX:-} env $EXTRA_ENV \
+    PYTHONPATH="${_SGL_PP:+$_SGL_PP:}${PYTHONPATH:-}" \
+    python -m sglang_router.launch_router \
+      --pd-disaggregation \
+      --prefill "$purl" "${bootarg[@]}" \
+      --decode "$durl" \
+      --host "$host" --port "$port" \
+      --model-path "$MODEL" \
+      --policy "${PD_LB_POLICY:-round_robin}" \
+      --worker-startup-timeout-secs "${PD_LB_STARTUP_TIMEOUT_S:-2400}" \
+      --request-timeout-secs "${PD_LB_REQUEST_TIMEOUT_S:-3600}" \
+      ${LB_EXTRA_ARGS:-} \
+      > "$LOG" 2>&1 &
+  SERVER_PID=$!
+}
+
 # adapter_bench NUM_PROMPTS MAX_CONC PROFILE_FLAG
 adapter_bench() {
   local NUMP="$1" MAXC="$2" PROF="${3:-0}"

@@ -38,9 +38,12 @@ It exists to close two systematic "isolated win / e2e loss" holes that a naive p
       form (observed-vs-ceiling) available to any downstream e2e comparison; an observed delta far above
       the ceiling is box drift / measurement error, not the kernel.
 """
+import glob
 import json
 import math
 import os
+import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -1298,7 +1301,90 @@ def _kill_process_group(proc, grace=5.0):
             continue
 
 
-def _run_leg(task_dir, overlay, mode, *, bucket="", out="", seed=0, draws=0, timeout=3600):
+# --------------------------------------------------------------------------- (d1) how a leg is started
+# A leg is "one measurement of one op", and for almost every op that is one local subprocess on one
+# card -- the Popen in `_run_leg` below. A COLLECTIVE is the single exception, and it is an exception in
+# exactly one respect: isolate an all-reduce on one card and it has no peers, so there is nothing left to
+# measure. `meta.execution_model` says which kind of leg a task has:
+#
+#     single_rank (default)    leg = subprocess.Popen on this box, one card
+#     distributed_collective   leg = `mn.py fanout`, one process per card across the pinned pair
+#
+# Everything ABOVE this line is indifferent to the answer -- ABBA interleaving, the running median, the
+# undecided window, the identity guard -- which is why the dispatch lives here and in no other file.
+#
+# Only the modes that need PEERS fan out. `resolve` answers "which file did this leg import" and `list`
+# enumerates bucket labels; both are properties of the overlay rather than of the topology, so paying a
+# 16-rank rendezvous for them would buy nothing and would make the identity guard depend on a live
+# cluster. A collective task's cases.py must therefore be enumerable without a process group.
+_FANOUT_MODES = ("time", "oracle")
+
+
+def _slug(text):
+    return re.sub(r"[^A-Za-z0-9._=-]+", "_", text)[:120]
+
+
+def _mn_py():
+    """Where `mn.py` is. `SKILL_DIR` is how a generated task already reaches the shared scripts (the
+    extractor copies harness_lib.py out of it), so this needs no new wiring -- only a name to fail on."""
+    tried = [p for p in (os.environ.get("GEAK_MN_PY", ""),
+                         os.path.join(os.environ.get("SKILL_DIR", ""), "scripts", "multi_node", "mn.py"))
+             if p and os.path.basename(p) == "mn.py"]
+    for path in tried:
+        if os.path.isfile(path):
+            return path
+    raise RuntimeError(
+        "a distributed_collective leg is started by mn.py fanout, and neither GEAK_MN_PY nor SKILL_DIR "
+        f"points at it (tried: {tried or 'nothing'}). The task dir vendors harness_lib.py but never the "
+        "launcher, because the machine pin lives outside the task.")
+
+
+def _run_leg_fanout(task_dir, overlay, mode, cmd, *, bucket="", timeout=3600):
+    """One leg = one `mn.py fanout`: the SAME leg_runner.py and the SAME overlay, started on every card
+    of the pinned pair instead of on one card here.
+
+    The leg's identity is still decided ONLY by the overlay on PYTHONPATH. The sixteen processes differ
+    from the local one in how many peers they have and in nothing else, so `speedup = baseline_ms /
+    candidate_ms` keeps meaning what it meant."""
+    out_dir = os.path.join(task_dir, "_fanout", _slug(f"{mode}-{bucket}" if bucket else mode))
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(out_dir, exist_ok=True)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([overlay] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    env["OVERLAY_PYTHONPATH"] = overlay
+    env["CMD"] = " ".join(shlex.quote(c) for c in cmd)
+    env["OUT_DIR"] = out_dir
+    # What a rank left over from a timed-out leg looks like. mn.py has no way to know that and must not
+    # guess; this is the only place that does.
+    env["FANOUT_KILL_PATTERN"] = os.path.join(task_dir, "leg_runner.py")
+    p = subprocess.run([sys.executable, _mn_py(), "fanout", "--timeout", str(int(timeout))],
+                       env=env, capture_output=True, text=True)
+    line = next((ln for ln in reversed(p.stdout.splitlines())
+                 if ln.startswith("MN_FANOUT_RESULT=")), "")
+    if not line:
+        raise RuntimeError(
+            f"leg({mode}) under {overlay} across the pin: mn.py fanout produced no result (rc="
+            f"{p.returncode}). This is a launcher/pin failure, not a candidate failure: "
+            f"{(p.stderr or p.stdout)[-800:]}")
+    summary = json.loads(line[len("MN_FANOUT_RESULT="):])
+    bad = [r for r in summary["ranks"] if r["rc"] != 0]
+    if bad:
+        # Name the rank. "the leg failed" sends the reader to the kernel; "rank 9 of 16 failed" sends
+        # them to the one box that behaved differently, which is where the answer is.
+        first = bad[0]
+        raise RuntimeError(
+            f"leg({mode}) under {overlay}: {len(bad)}/{summary['world_size']} rank(s) exited non-zero; "
+            f"rank{first['rank']} on {first['hostname'].split('.')[0]} exited {first['rc']}: "
+            f"{(first['out'] or '')[-800:]}")
+    rank0 = next((r for r in summary["ranks"] if r["rank"] == 0), None)
+    lines = [ln for ln in ((rank0 or {}).get("out") or "").strip().splitlines() if ln.startswith("{")]
+    if not lines:
+        raise RuntimeError(f"leg({mode}) under {overlay}: rank0 produced no JSON: "
+                           f"{((rank0 or {}).get('out') or '')[-800:]}")
+    return json.loads(lines[-1])
+
+
+def _run_leg(task_dir, overlay, mode, *, meta=None, bucket="", out="", seed=0, draws=0, timeout=3600):
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([overlay] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     cmd = [sys.executable, os.path.join(task_dir, "leg_runner.py"),
@@ -1309,6 +1395,11 @@ def _run_leg(task_dir, overlay, mode, *, bucket="", out="", seed=0, draws=0, tim
         cmd += ["--out", out]
     if draws:
         cmd += ["--draws", str(int(draws))]
+    # The ONE dispatch. `meta` is threaded from the caller rather than re-read here: every call site
+    # already has it, and a silent "meta.json was unreadable so assume one rank" would turn a
+    # misconfigured collective task into a leg with no peers instead of into an error.
+    if (meta or {}).get("execution_model") == "distributed_collective" and mode in _FANOUT_MODES:
+        return _run_leg_fanout(task_dir, overlay, mode, cmd, bucket=bucket, timeout=timeout)
     # Own process GROUP, not just a child: on timeout the leg may be mid-kernel or may have spawned
     # helpers, and killing only the direct child leaves those holding the GPU allocation. The NEXT leg
     # then times against a busy device and reads as a slowdown attributable to nothing.
@@ -1358,8 +1449,8 @@ def assert_legs_differ(task_dir, base, cand, meta, timeout=600):
     resolves OUTSIDE the task dir."""
     task = os.path.abspath(task_dir)
     target = meta["target_callable"]
-    bi = _run_leg(task, base, "resolve", timeout=timeout)
-    ci = _run_leg(task, cand, "resolve", timeout=timeout)
+    bi = _run_leg(task, base, "resolve", meta=meta, timeout=timeout)
+    ci = _run_leg(task, cand, "resolve", meta=meta, timeout=timeout)
     for who, ident in (("baseline", bi), ("candidate", ci)):
         if ident.get("error"):
             raise RuntimeError(f"{who} leg cannot import {target}: {ident['error']}")
@@ -1412,11 +1503,11 @@ def measure_legs(task_dir, meta, *, timeout=3600, max_reps=3, undecided=(0.95, 1
     assert_legs_differ(task, base, cand, meta)
     lo, hi = undecided
     per_case = []
-    for sig in _run_leg(task, base, "list", timeout=timeout)["sigs"]:
+    for sig in _run_leg(task, base, "list", meta=meta, timeout=timeout)["sigs"]:
         row, bms, oms = None, [], []
         for _ in range(max(1, int(max_reps))):
-            b = _run_leg(task, base, "time", bucket=sig, timeout=timeout)["cases"]
-            o = _run_leg(task, cand, "time", bucket=sig, timeout=timeout)["cases"]
+            b = _run_leg(task, base, "time", meta=meta, bucket=sig, timeout=timeout)["cases"]
+            o = _run_leg(task, cand, "time", meta=meta, bucket=sig, timeout=timeout)["cases"]
             if not b or not o:
                 break
             if row is None:
@@ -1448,6 +1539,74 @@ def baseline_random_outputs(task_dir, meta, *, seed=0, draws=0, timeout=3600):
     `check_random_vs_baseline(baseline_outputs=...)`. Same seed => same inputs on both sides."""
     task = os.path.abspath(task_dir)
     out = os.path.join(task, "_baseline_random.pt")
-    _run_leg(task, os.path.join(task, "baseline_overlay"), "oracle",
+    _run_leg(task, os.path.join(task, "baseline_overlay"), "oracle", meta=meta,
              out=out, seed=seed, draws=draws, timeout=timeout)
     return _torch().load(out, map_location="cpu")
+
+
+def distributed_random_outputs(task_dir, meta, which="baseline", *, seed=0, draws=0, timeout=3600):
+    """Random-draw outputs of a COLLECTIVE, recorded under the fanout and keyed by RANK.
+
+    Why this exists next to `baseline_random_outputs` instead of inside it: the single-rank flow records
+    only the BASELINE and lets the unittest call the candidate in its own process, because the candidate
+    needs nothing but a card. A collective candidate needs its fifteen peers, so it cannot be called from
+    the unittest's process at all -- BOTH sides have to be recorded under a fanout and compared
+    afterwards, file against file.
+
+    All sixteen ranks are kept, not just rank0's. A reduction that is right on the root and wrong on a
+    non-root rank is the characteristic collective bug, and reading the oracle only from rank0 is exactly
+    how it stays invisible."""
+    task = os.path.abspath(task_dir)
+    if which not in ("baseline", "candidate"):
+        raise ValueError(f"which must be 'baseline' or 'candidate', not {which!r}")
+    overlay = os.path.join(task, "baseline_overlay" if which == "baseline" else "_cand_overlay")
+    out = os.path.join(task, f"_{which}_random.pt")
+    for stale in glob.glob(out + ".rank*"):
+        os.remove(stale)                       # a blob from a previous round would read as this round's
+    _run_leg(task, overlay, "oracle", meta=meta, out=out, seed=seed, draws=draws, timeout=timeout)
+    blobs = {int(p.rsplit(".rank", 1)[1]): _torch().load(p, map_location="cpu")
+             for p in sorted(glob.glob(out + ".rank*"))}
+    if not blobs:
+        raise RuntimeError(
+            f"the {which} oracle leg reported success but wrote no {os.path.basename(out)}.rank* file. "
+            "Every rank writes its own; none appearing means the shared mount is not shared, which "
+            "would otherwise surface as an empty comparison that passes.")
+    return blobs
+
+
+def check_random_vs_baseline_per_rank(baseline_blobs, candidate_blobs, tol):
+    """Rank-for-rank, draw-for-draw comparison of two recorded collective output sets.
+
+    The distributed counterpart of `check_random_vs_baseline(baseline_outputs=...)`, and it returns the
+    same row shape so a generated unittest reports it through the unchanged path. Correctness is a HARD
+    gate here too; speedup is None because timing belongs to `measure_legs`.
+
+    A rank present in one set and missing from the other is a FAILURE, not a skip: a candidate that
+    silently produced nothing on half the ranks would otherwise compare zero cases and pass."""
+    per_case, all_ok = [], True
+    for rank in sorted(set(baseline_blobs) | set(candidate_blobs)):
+        base, cand = baseline_blobs.get(rank), candidate_blobs.get(rank)
+        if base is None or cand is None:
+            all_ok = False
+            per_case.append({"case": f"rank{rank}", "correct": False, "max_rel_err": None,
+                             "speedup": None,
+                             "note": f"rank{rank} recorded by the "
+                                     f"{'candidate' if base is None else 'baseline'} leg only"})
+            continue
+        for key in sorted(set(base) | set(cand)):
+            if key not in base or key not in cand:
+                all_ok = False
+                per_case.append({"case": f"rank{rank}:random:{key}", "correct": False,
+                                 "max_rel_err": None, "speedup": None,
+                                 "note": f"{key} recorded on one side only"})
+                continue
+            ok, err = correct(cand[key], base[key], tol)
+            all_ok = all_ok and ok
+            per_case.append({"case": f"rank{rank}:random:{key}", "correct": ok,
+                             "max_rel_err": round(err, 5) if math.isfinite(err) else None,
+                             "speedup": None,
+                             "note": "value-parity vs the live collective, this rank's own output"})
+    if not per_case:
+        raise RuntimeError("no recorded outputs to compare on either side — a correctness gate that "
+                           "checks nothing must fail loudly rather than return True")
+    return all_ok, per_case

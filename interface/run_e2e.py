@@ -388,6 +388,34 @@ def _targeting_shape(h: dict) -> tuple[int, int, str]:
     return obs_isl, obs_osl, "agentx_observed"
 
 
+def _multinode_topology(h: dict, tp: int) -> tuple[int, int]:
+    """Resolve (nodes, gpus_per_node) from the handoff.
+
+    Stated node count wins; otherwise the run is single-host, because guessing
+    "tp=16 must mean two boxes" would turn a wrong tp on a 16-GPU host into a
+    silent distributed launch. gpus_per_node defaults to tp/nodes -- the only
+    split under which a TP group fills the machines it was given.
+    """
+    nodes = _int_or_none(h.get("nodes") or h.get("nnodes"), "handoff.nodes") or 1
+    if nodes < 1:
+        nodes = 1
+    stated = _int_or_none(h.get("gpus_per_node"), "handoff.gpus_per_node") or 0
+    if stated > 0:
+        gpus_per_node = stated
+    elif nodes > 1 and tp % nodes == 0:
+        gpus_per_node = tp // nodes
+    else:
+        gpus_per_node = tp
+    if nodes > 1 and gpus_per_node * nodes != tp:
+        # Not fatal: a caller may deliberately serve tp<world on a pinned pair.
+        # Silence would be, since the device list below is derived from it.
+        sys.stderr.write(
+            f"!!! handoff topology: nodes={nodes} x gpus_per_node={gpus_per_node} "
+            f"!= tp={tp}; serving tp={tp} on the stated node set.\n"
+        )
+    return nodes, gpus_per_node
+
+
 def map_args(h: dict, timeout_s: int | None = None) -> dict:
     workload = h.get("workload") or {}
     tp = int(h.get("tp", 1) or 1)
@@ -427,9 +455,19 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
         initial_overlay = ":".join(
             dict.fromkeys(part for part in overlay_parts if part)
         )
+    # Multi-node topology. nodes=1 (the default) leaves every path below
+    # byte-identical to the single-host behaviour.
+    nodes, gpus_per_node = _multinode_topology(h, tp)
     # gpu_ids is the optimization-parallelism pool AND the serving device set.
     # Default to 0..tp-1 so serving honours the requested tensor-parallel size.
-    gpu_ids = h.get("gpu_ids") or ",".join(str(i) for i in range(max(tp, 1)))
+    # Across nodes that default is wrong in a way that does not announce itself:
+    # TP=16 on two 8-GPU boxes would ask for devices 0..15 on EVERY node, which
+    # names eight cards that do not exist there. The per-node device count is the
+    # only meaning $GPU can have once the TP group spans machines -- it is what
+    # the GPU allow-list is checked against and what the serving lock is keyed on.
+    gpu_ids = h.get("gpu_ids") or ",".join(
+        str(i) for i in range(max(gpus_per_node if nodes > 1 else tp, 1))
+    )
     target_isl, target_osl, shape_provenance = _targeting_shape(h)
     ps_args = {
         "model_path": h["model_path"],
@@ -473,6 +511,11 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
         "apply_to_original": "true",
         "exp_root": h["exp_root"],
     }
+    # Only surfaced when the run really is distributed, so a single-host args
+    # object is unchanged and the workflow keeps its existing defaults.
+    if nodes > 1:
+        ps_args["nodes"] = nodes
+        ps_args["gpus_per_node"] = gpus_per_node
     if effective is not None:
         ps_args["effective_config_digest"] = effective.digest
     # Forward the orchestrator's HARD wall-clock budget (the same timeout_s this
@@ -533,6 +576,20 @@ def map_args(h: dict, timeout_s: int | None = None) -> dict:
     # No timed-repeat pass-through: the round count belongs to the lifecycle, not the handoff, so
     # an `e2e_repeats` key from a stale caller is ignored rather than allowed to pull one leg off
     # the lifecycle the rest of the run used.
+    # The config sweep is defaulted off above for a Hyperloom caller, whose EXPLORE
+    # already searched server flags/env. A caller that ran no such search has to be
+    # able to turn it back on: without this, CONFIG_TUNE_ENABLED is false, phase
+    # ConfigSweep never runs, and the launch config stays exactly as handed in.
+    if h.get("config_tune") is not None:
+        ps_args["config_tune"] = "true" if _as_bool(h["config_tune"]) else "false"
+    # Breadth caps for the two kernel lanes. The workflow's own defaults (6 kernel
+    # tasks, and a head track sized by the profile) are right when the goal is the
+    # best number; they are wrong when the goal is to exercise every lane once and
+    # reach Finalize. Only the count is forwarded — the phases themselves, their
+    # gates and their evidence rules are untouched. Omitted => workflow defaults.
+    for key in ("kernel_budget", "head_budget"):
+        if h.get(key) is not None:
+            ps_args[key] = int(h[key])
     # Standalone tuning-skillset phase (workflow default ON). This is NOT the
     # config_tune sweep disabled above: Hyperloom's EXPLORE searched server
     # flags/env, whereas this phase runs the vendored tuning skillset's own loop
@@ -1381,6 +1438,122 @@ def _magpie_script_from_recipe(h: dict) -> str:
     return ""
 
 
+def _serving_topology() -> dict:
+    """The node set the server was actually served on, read back from the pin.
+
+    Taken from mn_state.json rather than from the handoff: the handoff states an
+    intent, the pin records the machines that served, and when they differ the
+    second one is what produced the number.
+    """
+    nodes = _int_or_none(os.environ.get("GEAK_MN_NODES"), "GEAK_MN_NODES") or 1
+    topology = {
+        "nodes": nodes,
+        "gpus_per_node": _int_or_none(
+            os.environ.get("GEAK_MN_GPUS_PER_NODE"), "GEAK_MN_GPUS_PER_NODE"
+        ) or None,
+    }
+    if nodes <= 1:
+        return topology
+    state_path = os.environ.get("GEAK_MN_STATE", "")
+    state = _read_json(Path(state_path)) if state_path else {}
+    if state:
+        topology.update({
+            "pinned_hosts": [
+                str(n.get("hostname", "")).split(".")[0] for n in state.get("nodes", [])
+            ],
+            "master_ip": state.get("master_ip"),
+            "pinned_at": state.get("pinned_at"),
+            "shared_fs": state.get("shared_fs"),
+        })
+    return topology
+
+
+def _pin_topology(state_path: str) -> str:
+    """topology field of an existing pin, or '' when the pin is absent or unreadable."""
+    path = Path(state_path) if state_path else None
+    if path is None or not path.is_file():
+        return ""
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(state, dict):
+        return ""
+    return str(state.get("topology") or "").strip()
+
+
+def apply_multinode(h: dict) -> dict:
+    """Export the cluster handoff the multi-node launcher reads, or refuse.
+
+    GEAK does not create, resize or tear down the cluster -- the caller hands one
+    over, exactly as Hyperloom's multi-node path does. What arrives here is:
+
+      * shared_fs    the filesystem every node mounts. MANDATORY, because it is
+                     what makes "ship the overlay to all ranks" and "collect the
+                     traces back" non-problems: one path, visible everywhere.
+      * ray_address  how to reach the cluster manager ("auto" = the local head).
+      * ports        the serving port and the dist-init port, pinned so the
+                     client, the health probe and every rank agree on one number.
+      * service_url  only for attaching to a service the caller already started.
+
+    Refusing when shared_fs is missing is the point: the alternative is a run
+    that launches, measures, and reports a speedup for an overlay that only ever
+    reached rank0 -- a wrong number that looks exactly like a right one.
+    """
+    tp = int(h.get("tp", 1) or 1)
+    nodes, gpus_per_node = _multinode_topology(h, tp)
+    mn = h.get("multinode") if isinstance(h.get("multinode"), dict) else {}
+    info = {"nodes": nodes, "gpus_per_node": gpus_per_node}
+    if nodes <= 1:
+        return info
+
+    shared = str(mn.get("shared_fs") or os.environ.get("GEAK_MN_EXT_SHARED_FS", "")).strip()
+    if not shared:
+        raise SystemExit(
+            f"!!! handoff asks for nodes={nodes} but names no shared filesystem.\n"
+            "    Set multinode.shared_fs (or GEAK_MN_EXT_SHARED_FS) to a path every\n"
+            "    node mounts. Without it the authored overlay reaches only the node\n"
+            "    GEAK runs on, the other ranks serve stock code, and the run still\n"
+            "    reports a speedup -- for a kernel half the ranks never loaded."
+        )
+    os.environ["GEAK_MN_EXT_SHARED_FS"] = shared
+    os.environ["GEAK_MN_NODES"] = str(nodes)
+    os.environ["GEAK_MN_GPUS_PER_NODE"] = str(gpus_per_node)
+
+    service_url = str(mn.get("service_url") or os.environ.get("GEAK_MN_EXT_SERVICE_URL", "")).strip()
+    if service_url:
+        os.environ["GEAK_MN_EXT_SERVICE_URL"] = service_url
+    for key, env in (("ray_address", "GEAK_MN_RAY_ADDRESS"),
+                     ("serve_port", "GEAK_MN_SERVE_PORT"),
+                     ("dist_init_port", "GEAK_MN_DIST_INIT_PORT"),
+                     ("cluster_subnet", "GEAK_MN_CLUSTER_SUBNET")):
+        # No `dp` here on purpose: data-parallel width is an ordinary server flag
+        # in whatever the framework calls it, so it rides the normal server-args
+        # channel. Only facts the launcher itself needs -- which cluster, which
+        # ports, which fabric -- belong in this list.
+        val = str(mn.get(key) or "").strip()
+        if val:
+            os.environ[env] = val
+    # The pin itself lives on the shared mount, so every process in the run --
+    # this driver, each bench_e2e.sh, the supervisor -- reads the same one.
+    os.environ.setdefault("GEAK_MN_STATE", str(Path(shared) / "mn_state.json"))
+    # The pin is the authority for which topology is actually serving. A handoff
+    # that names one is the fallback for a pin that has not been written yet.
+    topo = _pin_topology(os.environ["GEAK_MN_STATE"]) or str(
+        mn.get("topology") or h.get("topology") or ""
+    ).strip()
+    if topo:
+        os.environ["GEAK_MN_TOPOLOGY"] = topo
+        info["topology"] = topo
+    info.update({
+        "shared_fs": shared,
+        "service_url": service_url,
+        "state": os.environ["GEAK_MN_STATE"],
+        "state_exists": Path(os.environ["GEAK_MN_STATE"]).is_file(),
+    })
+    return info
+
+
 def apply_bench_launcher(h: dict) -> str:
     """Align the SERVER LAUNCH recipe with the external orchestrator (Magpie).
 
@@ -1440,12 +1613,25 @@ def apply_bench_launcher(h: dict) -> str:
         os.environ["MAGPIE_LAUNCH_SCRIPT"] = script
         os.environ["MAGPIE_LAUNCH_SCRIPT_SOURCE"] = source
 
+    nodes, _ = _multinode_topology(h, int(h.get("tp", 1) or 1))
     if requested and requested != "auto":
         launcher = requested
+    elif nodes > 1:
+        # Not a preference: the native launch and Magpie's script both start ONE
+        # local server, so on a multi-node handoff they would serve a TP group
+        # that fits on one box and measure a completely different config from the
+        # one requested. There is no fallback worth having here.
+        launcher = "multinode"
     elif script and backend in _MAGPIE_BACKENDS:
         launcher = "magpie"
     else:
         launcher = "native"
+    if nodes > 1 and launcher != "multinode":
+        sys.stderr.write(
+            f"!!! handoff asks for nodes={nodes} but bench_launcher='{launcher}' was\n"
+            "    requested explicitly. That launcher starts a single local server;\n"
+            "    the run will measure a single-node config.\n"
+        )
     os.environ["BENCH_LAUNCHER"] = launcher
     if int(h.get("schema_version", 1) or 1) >= 2 and isinstance(
         h.get("baseline_env_spec"), dict
@@ -1798,6 +1984,40 @@ def _iter_message_text(msg: Any) -> list[str]:
     return out
 
 
+def _newest_mtime(eval_dir: str | None, max_entries: int = 20000) -> float:
+    """Newest mtime anywhere under ``eval_dir`` — "is the run still producing?".
+
+    Used to progress-extend the completion grace window. Bounded by
+    ``max_entries`` so a pathologically large tree cannot stall the poll, and
+    total-failure-tolerant: an unreadable tree reports 0.0, which simply means
+    "no progress observed" and lets the flat window apply.
+    """
+    if not eval_dir:
+        return 0.0
+    newest = 0.0
+    seen = 0
+    for root, _dirs, files in os.walk(eval_dir, onerror=lambda _e: None):
+        for name in (*files, "."):
+            try:
+                newest = max(newest, os.stat(os.path.join(root, name)).st_mtime)
+            except OSError:
+                continue
+            seen += 1
+            if seen >= max_entries:
+                return newest
+    return newest
+
+
+def _is_recovered_return(obj: dict) -> bool:
+    """True when a workflow return was rebuilt by US, not returned by the workflow.
+
+    Every reconstruction this module emits stamps itself with a ``recovered_*``
+    key. Matching the whole prefix (rather than a fixed list) keeps new recovery
+    tiers self-identifying without having to be registered in two places.
+    """
+    return any(str(k).startswith("recovered") and obj.get(k) for k in obj)
+
+
 def _workflow_done_on_disk(eval_dir: str | None) -> bool:
     """True once the workflow wrote a TERMINAL marker (its very last on-disk act).
 
@@ -1810,6 +2030,17 @@ def _workflow_done_on_disk(eval_dir: str | None) -> bool:
         just before. Kept as an alternative in case the canonical persist step
         (an agent Write) failed.
 
+    A ``workflow_return.json`` that WE wrote from our own disk recovery is NOT a
+    terminal marker, even though it parses like one. The recovery path runs
+    precisely when the workflow did NOT finish, so counting its output here made
+    an unfinished run look terminal: the resume short-circuit in main() then
+    re-emitted the reconstruction instead of resuming, and the SDK completion
+    gate saw "done" the moment recovery had ever run. That permanently pinned a
+    run to whatever phase it died in — a checkpoint-level recovery (e.g. one
+    that stopped before the kernel phase) could never be continued. Recovery
+    reconstructions are self-identifying via their ``recovered_*`` markers, the
+    same signal :func:`_recover_workflow_return` uses to refuse to trust them.
+
     ``final/final_launch.sh`` is intentionally NOT terminal: it is written by the
     EARLIER Finalize phase, BEFORE Report/Validate. Treating it as done made the
     SDK completion gate fire one or two phases early and SKIP the grace poll that
@@ -1820,9 +2051,10 @@ def _workflow_done_on_disk(eval_dir: str | None) -> bool:
     if not eval_dir:
         return False
     p = Path(eval_dir)
-    return (p / WORKFLOW_RETURN_FILE).is_file() or (
-        p / "director_e2e_validation.json"
-    ).is_file()
+    wr = p / WORKFLOW_RETURN_FILE
+    if wr.is_file() and not _is_recovered_return(_read_json(wr)):
+        return True
+    return (p / "director_e2e_validation.json").is_file()
 
 
 def _invoke_via_sdk(prompt: str, timeout_s: int, eval_dir: str | None = None) -> str:
@@ -1954,6 +2186,19 @@ def _invoke_via_sdk(prompt: str, timeout_s: int, eval_dir: str | None = None) ->
                 # keeps running) and poll the disk until the marker appears or
                 # the bounded grace expires. The enclosing fail_after(timeout_s)
                 # still caps total time, so this can never exceed the hard budget.
+                #
+                # The window is PROGRESS-EXTENDED, not a flat countdown. A task
+                # notifying terminal does not mean the run is over: the driving
+                # agent may relaunch the workflow (a resume after a failed phase
+                # writes a new background task we can no longer see, because we
+                # have already left the message loop), and a detached leg can
+                # outlast any fixed window. Closing the client is what SIGKILLs
+                # the CLI process tree, so a flat deadline kills whatever is
+                # running at that instant — that is how a resumed run that was
+                # 7 minutes into re-extracting a kernel got torn down mid-Bash.
+                # So: re-arm the deadline whenever the eval_dir is still being
+                # written to. Idle work cannot extend it, and the outer budget
+                # is still the hard stop.
                 if (
                     terminal_task
                     and saw_result
@@ -1961,10 +2206,15 @@ def _invoke_via_sdk(prompt: str, timeout_s: int, eval_dir: str | None = None) ->
                     and not _workflow_done_on_disk(eval_dir)
                 ):
                     deadline = time.monotonic() + DONE_GRACE_S
+                    last_progress = _newest_mtime(eval_dir)
                     while time.monotonic() < deadline:
                         if _workflow_done_on_disk(eval_dir):
                             break
                         await anyio.sleep(DONE_POLL_S)
+                        seen = _newest_mtime(eval_dir)
+                        if seen > last_progress:
+                            last_progress = seen
+                            deadline = time.monotonic() + DONE_GRACE_S
         return "\n".join(chunks)
 
     async def _run_query() -> str:
@@ -3251,6 +3501,10 @@ def normalize_result(h: dict, wf: dict) -> dict:
         "launch_script": os.environ.get("MAGPIE_LAUNCH_SCRIPT", ""),
         "launch_script_source": os.environ.get("MAGPIE_LAUNCH_SCRIPT_SOURCE", ""),
         "recipe_aligned_with_orchestrator": recipe_aligned,
+        # Topology belongs in the provenance for the same reason the launcher
+        # does: a tok/s figure from 16 GPUs across two boxes is not comparable
+        # to one from 8, and nothing else in this file would say which it was.
+        "topology": _serving_topology(),
         "baseline": _serving_stack_signals(eval_dir / "baseline" / "server.log"),
         "validation_base": _serving_stack_signals(
             eval_dir / "validation" / "base" / "server.log"
@@ -5157,10 +5411,7 @@ def _recover_workflow_return(exp_root: Path) -> dict | None:
     # flags) must be re-derived fresh here, otherwise a stale reconstruction would
     # permanently shadow later recovery improvements (e.g. newly-extracted latency).
     persisted = _read_json(eval_dir / WORKFLOW_RETURN_FILE)
-    if persisted.get("eval_dir") and not any(
-        persisted.get(k)
-        for k in ("recovered_from_disk", "recovered_intermediate", "recovered_no_gain")
-    ):
+    if persisted.get("eval_dir") and not _is_recovered_return(persisted):
         return persisted
     validation = _read_json(eval_dir / "director_e2e_validation.json")
     if not validation:
@@ -6588,6 +6839,13 @@ def main(argv: list[str]) -> int:
     os.environ["GEAK_EVAL_DIR"] = ps_args["eval_dir"]
     _publish_protected_pgids()
     bench_client = apply_bench_client(h)
+    # Before the launcher: its auto-selection depends on the node count, and the
+    # launcher adapter reads the GEAK_MN_* env this exports.
+    multinode = apply_multinode(h)
+    # So the workflow can tell a disaggregated pair from a TP group that spans
+    # both boxes. Empty on a single host, and map_args itself stays unchanged.
+    if multinode.get("topology"):
+        ps_args["topology"] = multinode["topology"]
     bench_launcher = apply_bench_launcher(h)
     workload_exports = apply_workload_spec(h)
     workload_preflight = agentx_preflight(h)
@@ -6600,6 +6858,7 @@ def main(argv: list[str]) -> int:
                           "bench_launcher": bench_launcher,
                           "workload_spec_exports": workload_exports,
                           "agentx_preflight_problems": workload_preflight,
+                          "multinode": multinode,
                           "magpie_launch_script": os.environ.get("MAGPIE_LAUNCH_SCRIPT", ""),
                           "magpie_launch_script_source": os.environ.get("MAGPIE_LAUNCH_SCRIPT_SOURCE", ""),
                           "recipe_env_file": os.environ.get("RECIPE_ENV_FILE", ""),

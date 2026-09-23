@@ -56,7 +56,8 @@ faster" to "make it move fewer bytes" (step 1d). Never let a headroom estimate d
 **`edit=N` (library) does NOT mean "skip" — it means "Tier-C code rewrite is unavailable."** A
 fixed-shape GEMM is one of the most tunable things on the chip. Route by *which optimization the op
 admits*, not by the edit flag:
-- **Head track** — any kernel with `pct_gpu_time ≥ HEAD_THRESHOLD_PCT` (default 5%), GEMM or attention,
+- **Head track** — any kernel with `pct_gpu_time ≥ HEAD_THRESHOLD_PCT` (default 5%), GEMM or attention —
+  or a **collective that has passed the wire-budget gate** (step 2, `op_select` track) —
   **regardless of edit flag** → Kernel Extractor `extract_op` → **Op Benchmarker** ladder: Tier A
   backend select → Tier B per-backend tune (**GEMM = aiter per-shape DB**, NOT TunableOp) → **Tier C
   ALWAYS author+optimize a real kernel via kernel_workflow (triton ≥1)** → Tier D quant. **All GEMM
@@ -64,6 +65,13 @@ admits*, not by the edit flag:
 - **Config fast path** — only true service-level switches that need no op isolation: `--attention-backend`,
   cuda-graph/torch.compile, `--quantization fp8`, kv-cache-dtype, scheduling/mem knobs → Config Tuner,
   tried FIRST (cheapest, one launch). Do NOT route GEMM here (no TunableOp/`HIPBLASLT_TUNING_FILE`).
+- **op_select track** — an op whose lever is *which implementation runs* and that has no meaningful
+  isolated single-GPU form, so the head track cannot reach it. In practice: **collectives**
+  (`classification: "comm"` — TP all-reduce/all-gather/reduce-scatter). `edit=N` here means the same
+  thing it means for a library GEMM — **not** "skip". The lever is the AR implementation and the bytes it
+  puts on the wire. Emit as `config_directions` with `lever_kind: "op_select"`; these survive
+  `CONFIG_TUNE_ENABLED=false`. See step 2's `nnodes > 1` block for the ladder. There is no Tier-C rung
+  here: a collective isolated to one rank has no peers, so it cannot be authored and benched as an op.
 - **Kernel track** — editable custom/Triton kernels *below* the head threshold (mamba/gated-delta,
   norms, activations, rope) → Kernel Extractor + recursive squad. The Milestone loop must dispatch at
   least `MIN_KERNEL_TASKS` of these (see plan_milestone).
@@ -134,6 +142,43 @@ OPTIONAL upstream TraceLens prior (may be empty strings — treat empty/missing 
    (use the backend playbook priors for plausible_speedup per class, keyed by `model_class`+`gfx` when
    present). Note the regime each serves (large-M shape = prefill, small-M/batch = decode). **Dedupe
    GEMMs by shape** — one bake-off per distinct (shape,dtype) covers all its launches.
+
+   **PD-disaggregated serving (the Top-N has a top-level `per_role` block and a `role` on every row).**
+   The table is already the whole deployment: `mn.py topn-merge` folded the prefill engine's Top-N and
+   the decode engine's into one, each row rescaled by its engine's share of total GPU time, so **rank
+   across both exactly as you would a single table — the Amdahl arithmetic is unchanged**. Three things
+   change around it:
+   - **Carry the row's `role` onto the candidate as `engine`.** It is what tells the Kernel Extractor
+     which engine's shapes to build the unittest against, and a candidate without it gets the merged
+     default. (Do not reuse the `role` key on a candidate — that one names the seam kind.)
+   - **Do not dedupe across engines.** The same kernel name on both is TWO candidates: prefill runs it
+     at a chunk-sized M, decode at a batch-sized M, on different machines. One fix rarely serves both,
+     and a bake-off run for one is not evidence for the other.
+   - **`pct_gpu_time_in_role` is the other half of the story.** A kernel at 8% of the deployment may be
+     28% of the decode engine, and the levers that engine owns (its own server flags, its own backend
+     selection) act on that 28%. Rank on `pct_gpu_time`; explain the choice with both, and say in
+     `regime_summary` which engine is the bottleneck and by how much.
+   - **The bottleneck is measured, not inferred.** When the table has `latency_split`, take
+     `bottleneck_engine` and each `per_role[].e2e_share_pct` from it and quote them. A row's
+     `pct_e2e_est` (in-engine share × that engine's share of E2E latency) is the throughput the
+     kernel can move under the closed-loop bench; use it as `plausible_speedup`'s ceiling, and
+     demote a row whose `pct_e2e_est` is far below its `pct_gpu_time` (high GPU time on the
+     engine the requests do not wait on). Prefill's share includes queueing and the KV transfer,
+     so it is an upper bound. Without `latency_split`, say the bottleneck is unmeasured.
+   - **Tag each `config_directions` entry with `engine`.** `prefill` or `decode` when the knob
+     belongs to that engine (prefill: chunk / batched-token budget; decode: running batch, decode
+     graph shape). `""` only when the same value is right on both (a shared attention-backend
+     choice, a collective implementation). Do not put a one-engine knob in a direction with
+     `engine: ""` — the Tuner applies that string to both machines.
+   - **Read config directions off each engine's OWN table (`PROFILE_TOPN_BY_ROLE`, or
+     `per_role[].topN_json` in the merged table).** The merged table keeps 25 rows by deployment
+     share, so the engine with less GPU time can drop out of it entirely and then nobody proposes
+     a knob for it. An engine's own flags act on 100% of that engine, which is its own table.
+     Heads still come from the merged table: those compete across engines for one budget.
+     The orchestrator checks this: a profiled engine with no direction gets one focused re-ask
+     with `CONFIG_DIRECTIONS_FOR_ENGINE=<role>`. On that call return `config_directions` for that
+     engine only (each with `engine: <role>`), read off its own table. If it genuinely has nothing
+     to tune, return an empty list and say why in `regime_summary`; the gap is then reported.
 1b. **TraceLens prior (ADVISORY — only if `TRACELENS_KERNEL_CANDIDATES_JSON` / `TRACELENS_REPORT_JSON`
    is a non-empty path that EXISTS).** Read its `hot_kernels[]`. Each entry pre-resolves things you would
    otherwise hand to the Extractor: `source_file`/`source_path` (the patched python source),
@@ -196,6 +241,57 @@ OPTIONAL upstream TraceLens prior (may be empty strings — treat empty/missing 
    - **config fast path** — service-level env/flag with no op isolation: `--attention-backend` swap,
      `--quantization fp8`, cuda-graph, torch-compile, kv-cache-dtype, scheduling/mem knobs → Config
      Tuner, FIRST. **GEMM tuning is NOT a config axis** (it's a head-track op now).
+   - **op_select track** — an operator whose only lever is *which implementation runs*, chosen by env at
+     the live seam, and which the head track **cannot** reach because it has no meaningful isolated
+     single-GPU form. **Collectives are the case that matters:** TP/EP all-reduce, all-gather,
+     reduce-scatter (`classification: "comm"`). Isolating an all-reduce to one rank leaves it with no
+     peers, so `extract_op` is not available **on a single-host run** — but the implementation choice is real and measurable on
+     the live stack: RCCL vs custom 1-shot/2-shot AR over xGMI P2P vs **quantized QuickReduce**
+     (int8/int6/int4/fp8 on the wire → accuracy gate), plus comm-compute overlap, NCCL channels, and
+     AR+RMSNorm fusion. Ladder + knobs: `perf_knowledge/operators/allreduce/` (`overview.md`,
+     `tuning.md`, `numerics.md`, `backends/`) and `perf_knowledge/backends/mori_rccl/rccl_tuning.md`.
+     Emit these as `config_directions` entries carrying **`lever_kind: "op_select"`**, each with its
+     `axis`, the env/flag it sets, the expected byte or latency effect, and (for quantized AR) the
+     parity check it requires.
+     **`op_select` stays in scope when `CONFIG_TUNE_ENABLED=false`** — that flag gates exploratory
+     parameter search, never an operator's implementation choice, on the same principle as the
+     backend-select env a head kernel needs to engage its artifact (step 2b). So do NOT drop comm
+     directions when the flag is off, and do NOT smuggle ordinary parameters (batching, memory
+     fraction, scheduling, cuda-graph) in under this tag — the Tuner runs op_select-only in that mode
+     and a mistagged parameter is the one thing that can corrupt it.
+     **On `nnodes > 1` this is usually the top lever, not a footnote.** Rank it on the collective's
+     **raw** `pct_gpu_time`, not only the de-inflated one (observed: 63.9–66.5% raw RCCL on TP16 across
+     two boxes, where the fabric rather than the xGMI mesh is the roof). A byte-reduction on the wire
+     pays back on both the transfer and the spin waiting on it.
+     **🔴 `nnodes > 1` also changes WHERE the candidates come from — get this wrong and the whole lane
+     is wasted on guaranteed non-engagements.** `perf_knowledge/operators/allreduce/overview.md` is
+     written around a single 8×MI300X node on a fully-connected xGMI mesh, and its headline backends —
+     custom 1-shot/2-shot AR, quantized QuickReduce, aiter `fused_allreduce_rmsnorm` — are **all built
+     on peers reading each other's HBM directly**. That is a same-node property, so the framework turns
+     the entire family off the moment the process group spans nodes, and the world-size whitelists
+     (`[2,4,8]` for quick, `[2,4,6,8]` for custom) exclude TP16 on top of that. Proposing them
+     cross-node burns candidate slots on outcomes you can read out of the baseline `server.log` for
+     free. So when `nnodes > 1`:
+       · **Step 0, before proposing anything: observe the transport.** One boot with `NCCL_DEBUG=INFO`
+         and `RCCL_DEBUG_SUBSYS=INIT,GRAPH`, then read which net / algorithm / protocol / channel count
+         RCCL actually chose. A cluster whose fast NICs are point-to-point and do not route will fall
+         back to a management NIC, and that wire — not the software — is the roof.
+       · **Draw candidates from the RCCL env table**, `perf_knowledge/backends/mori_rccl/rccl_tuning.md`,
+         which carries the multi-node rows: `NCCL_NET_GDR_LEVEL`, `NCCL_IGNORE_CPU_AFFINITY`,
+         `NCCL_IB_HCA` / `NCCL_IB_GID_INDEX`, `NCCL_MIN_NCHANNELS`, `RCCL_MSCCLPP_THRESHOLD`; and for a
+         socket fallback, `NCCL_SOCKET_IFNAME` / `NCCL_SOCKET_NTHREADS` / `NCCL_NSOCKS_PERTHREAD`.
+         **That card is filed under a backend the router never selects, so you must open it explicitly.**
+       · **Do not spend the round on comm/compute overlap when comm dominates.** Overlap hides the
+         collective under independent compute; at ~66% comm that compute does not exist, and raising
+         collective stream priority measured −5.10%.
+       · Read `knowledge/learned/crossnode-tp-allreduce-gfx942.md` first — it has the banners, the source
+         line numbers and the measured numbers, so you can rule the dead levers out in minutes.
+       · **The env ladder is the last rung; say so and move the round elsewhere.** There is no authoring
+         candidate below it — a collective isolated to one rank has no peers to time. And once the ladder
+         is exhausted the roof is the wire: at 8 MB the tuned collective already sits on a ≈3.1 GB/s
+         management NIC, and **no kernel creates bandwidth**. Check skew first (`roles/profiler.md`): at
+         per-call skew well above ~1.5× the comm row is peer-wait spin, so the time is somebody else's
+         imbalance and belongs to whichever rank is late.
    - **head track** (`pct_gpu_time ≥ HEAD_THRESHOLD_PCT`, GEMM or attention, **any edit flag**) →
      `extract_op` + Op Benchmarker (per-backend tune via aiter DB for GEMM + ALWAYS author triton). For
      each, give op_kind, the profiled shapes+dtype, the ranked candidate backends (aiter/hipblaslt/
@@ -264,12 +360,14 @@ Return JSON:
   "regime_summary": "prefill-dominated|decode-dominated|mixed; why",
   "config_directions": [
     {"id": "cfg0", "axis": "attention-backend|quant|cuda-graph|torch-compile|kv-cache-dtype|...",
+     "engine": "<PD only: prefill|decode, or \"\" when the same value belongs on both engines>",
      "swaps": ["ranked option A", "option B"], "target_kernels": ["short_name"],
      "expected_pct_gpu": 0.0, "rationale": "playbook prior + which Top-N entry it targets"}
   ],
   "head_candidates": [
     {"id": "h0", "short_name": "...", "op_kind": "gemm|attn", "pct_gpu_time": 0.0,
      "shapes": "[[1024,5120],[5120,34816]]", "dtype": "bf16", "regime": "prefill|decode|both",
+     "engine": "<PD only: copy the Top-N row's `role` (prefill|decode); \"\" when the Top-N has none>",
      "entity_kind": "gpu_kernel",
      "device_kernel": "<exact GPU symbol copied from profile>",
      "target_callable": "<exact module:attr hint selected from seam_candidates, or ''>",
@@ -297,6 +395,7 @@ Return JSON:
   "kernel_candidates": [
     {"id": "k0", "short_name": "...", "classification": "...", "pct_gpu_time": 0.0,
      "regime": "prefill|decode|both", "candidate_backends": ["triton","hip","ck","asm"],
+     "engine": "<PD only: copy the Top-N row's `role` (prefill|decode); \"\" when the Top-N has none>",
      "amdahl_priority": 0.0, "extract_hint": "which callable to hook (module:attr) + why",
      "source_hint": "<TraceLens source_file/source_path if any, else ''>",
      "launcher_hint": "<TraceLens kernel_path/launcher_source_file if any, else ''>",

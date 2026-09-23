@@ -1,0 +1,45 @@
+# Per-rank server launch, rendered by `mn.py launch` and executed ON the target
+# node by a pinned Ray task.
+#
+# FRAMEWORK-AGNOSTIC ON PURPOSE. Everything below is a fact about the NODE:
+# which NIC, which master, where the logs go. HOW to start a server belongs to
+# the backend adapter (adapters/sglang.sh, adapters/vllm.sh) and WHAT config to
+# serve belongs to the recipe, so both arrive from outside instead of being
+# restated here. A copy of the launch line in this file would mean a second
+# framework needs a second copy of the whole file, and the two would drift.
+#
+# Placeholders are all mandatory: `mn.py launch` refuses to launch if any survives
+# the render, so a renamed one fails loudly instead of serving a config nobody
+# asked for.
+__RANK_PREAMBLE__
+
+# The env contract bench_e2e.sh gives a backend adapter, reproduced for one rank.
+# GPU is the PER-NODE device list: once the TP group spans machines, that is the
+# only meaning a device list can have.
+export MODEL=__MODEL__ TP=__TP__ GPU=__GPU__ MEM_FRACTION=__MEM_FRACTION__
+# BASE_URL is rendered whole rather than composed from MASTER and PORT: under
+# prefill/decode disaggregation each engine has its OWN endpoint, and the address
+# the client talks to belongs to the load balancer in front of them.
+export HOST=0.0.0.0 PORT=__PORT__ BASE_URL="__BASE_URL__"
+export LOG=__LOG__ PROFILE_DIR=__PROFILE_DIR__
+export OVERLAY_PYTHONPATH=__OVERLAY__ PYTHONPATH=__PYTHONPATH__
+export EXTRA_ENV="__EXTRA_ENV__"
+# Same layering as adapters/launchers/magpie.sh: the recipe is the BASE layer and
+# GEAK's accepted flags come LATER, so a swept flag wins any conflict by argparse
+# last-wins and nothing GEAK chose can be displaced by the recipe.
+export EXTRA_SERVER_ARGS="__RECIPE_ARGS__ __EXTRA_ARGS__"
+# The adapter contract. Here it also gives the rank its own process group, so a
+# reap aimed at the server cannot take this script's group with it.
+export SERVER_LAUNCH_PREFIX=setsid
+
+# HOW this framework starts a server, and how it says "I am rank i of n".
+. "__ADAPTER__"
+# Appended LAST because it is structural, not tunable: a sweep must not be able
+# to change which rank this process is, nor which half of a disaggregated pair.
+# The CALL is rendered (not just its arguments) because the two topologies ask
+# the adapter different questions -- adapter_dist_args for "I am rank i of n",
+# adapter_pd_args for "I am the prefill/decode half" -- and a process that got
+# asked the wrong one comes up looking healthy while serving the wrong shape.
+EXTRA_SERVER_ARGS="$EXTRA_SERVER_ARGS $(__STRUCTURAL_CALL__)"
+adapter_launch
+echo STARTED_PID=$SERVER_PID

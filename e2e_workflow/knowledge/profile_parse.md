@@ -96,8 +96,34 @@ different causes get different handling:
    EVERY collective that crosses the skew bar, then recompute the table (step below).
    → report a robust **effective** `pct_gpu_time` = median-cap winsorize (clip each call
    at ~10×median then sum; `median×calls` is a fine shortcut), **keep the raw** in
-   `raw_pct_gpu_time`/`notes`, and route it as a comm-overlap/load-imbalance **CONFIG** lever (AR
-   backend/quant, comm-compute overlap, NCCL channels) — never a kernel rewrite.
+   `raw_pct_gpu_time`/`notes`.
+
+   **Routing: an `op_select` lever — not a kernel rewrite, and NOT a plain config parameter either.**
+   There is no source to rewrite (the collective is a library kernel), so a Tier-C authoring task is
+   off the table. But "no rewrite" is not "nothing to do": for a collective the lever was never the
+   kernel body, it is **which all-reduce implementation is dispatched and how many bytes it puts on the
+   wire** — RCCL vs custom 1-shot/2-shot AR over xGMI P2P vs **quantized QuickReduce** (int8/int6/int4/
+   fp8 on the wire), plus comm-compute overlap, NCCL channels, and AR+RMSNorm fusion. See
+   `perf_knowledge/operators/allreduce/overview.md` for the ladder and `numerics.md` for the accuracy
+   gate that quantized AR opens.
+   Emit these as `config_directions` entries tagged **`lever_kind: "op_select"`**. That tag matters:
+   an op_select direction is the choice of an operator's implementation, so — exactly like the
+   backend-select env a head kernel needs to engage its artifact — it stays **in scope even when
+   `CONFIG_TUNE_ENABLED=false`**, which gates only exploratory parameter search. Do NOT tag ordinary
+   service parameters (batching, memory fraction, scheduling, cuda-graph) as op_select.
+
+   **Why a collective can never go to the head track:** the head track benches an op as an isolated
+   single-GPU unittest against a captured oracle, and an all-reduce isolated to one rank is not the op —
+   it has no peers. The live serving stack is the only place its implementation can be chosen and
+   measured, which is why op_select rides the sweep rather than `extract_op`.
+
+   **`nnodes > 1` changes the weight of this, so say so explicitly.** De-inflation exists so peer-wait
+   spin does not crowd the Amdahl table inside one node, where the xGMI mesh sustains ~316–330 GB/s and
+   AR is genuinely single-digit %. Across boxes the fabric — not the mesh — is the roof, and on a
+   cluster whose collectives fall back to a management NIC the tail is real wire time, not spin. Keep
+   de-inflating (the ranking still needs a robust number), but report `raw_pct_gpu_time` alongside it
+   and rank the op_select lever on the **raw** share when `nnodes > 1`: byte-reduction on the wire pays
+   back on both the transfer and the spin that waits on it.
 
 2. **One-time warmup / JIT / autotune / graph-capture outliers** (Triton/Inductor JIT-compile +
    autotune on first launch; HIP-graph capture; first-touch allocation). Signature: a *handful* of giant

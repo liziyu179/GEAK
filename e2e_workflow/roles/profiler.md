@@ -198,6 +198,47 @@ degrade to whatever is available, and if both analysis.md and trace are unusable
      --top 25 --out "$EVAL_DIR/profile/round_${ROUND}/profile_topN" \
      --workload-out "$EVAL_DIR/profile/round_${ROUND}/profile_workload.json"
    ```
+   **PD-disaggregated serving (`$PDIR/ranks/mn_trace_roles.json` EXISTS) — parse EACH ENGINE, then
+   merge.** That file is written by `mn.py trace-gate` and names one trace per engine, each in its own
+   subdirectory, because prefill and decode are separate TP worlds that both number their ranks
+   TP-0..TP-7 — the plain `ls -t | head -1` above would return one engine's trace and there would be
+   nothing to say which. They are also **two different machines doing two different jobs**, and that is
+   why one table cannot serve both: prefill's heads are compute-bound GEMMs whose framework lever is the
+   chunk/token budget, decode's are memory-bound attention whose lever is the batch and graph shape.
+   Ranking them together and reading one answer off the top routes each to the other's fix. So:
+   ```bash
+   ROLES="$PDIR/ranks/mn_trace_roles.json"
+   if [ -s "$ROLES" ]; then
+     RD="$EVAL_DIR/profile/round_${ROUND}"; MERGE=()
+     for R in $(python3 -c 'import json,sys;print(" ".join(e["role"] for e in json.load(open(sys.argv[1]))["roles"] if e["trace"]))' "$ROLES"); do
+       T=$(python3 -c 'import json,sys;print(next(e["trace"] for e in json.load(open(sys.argv[1]))["roles"] if e["role"]==sys.argv[2]))' "$ROLES" "$R")
+       python3 "$EVAL_DIR/parse_profile.py" --torch-trace "$T" \
+         --isl <isl> --osl <osl> --conc <conc> \
+         ${CHUNK:+--prefill-chunk "$CHUNK"} ${CAPTURE_SIZES:+--capture-sizes "$CAPTURE_SIZES"} \
+         --top 25 --out "$RD/profile_topN_$R" --workload-out "$RD/profile_workload_$R.json"
+       MERGE+=(--role "$R=$RD/profile_topN_$R.json")
+     done
+     # The single canonical table the Architect routes on, as a GPU-time-weighted
+     # union of the two: a kernel at 30% of prefill on an engine holding 40% of the
+     # deployment's GPU time is 12% of the deployment. Rows keep their `role`, so
+     # the same kernel on both engines stays two rows — one name, two shapes, two fixes.
+     # --bench-summary is THIS leg's bench: its TTFT/TPOT split says which engine the
+     # throughput waits on, which GPU time alone cannot.
+     python3 "${GEAK_MN_DIR:-$SKILL_DIR/scripts/multi_node}/mn.py" topn-merge \
+       "${MERGE[@]}" --top 25 --out "$RD/profile_topN" \
+       --bench-summary "$RD/bench_summary.json" --osl <osl>
+   fi
+   ```
+   Put the merged table's `bottleneck_engine` and each `per_role[].e2e_share_pct` in `notes`. If the
+   merge printed `no TTFT/TPOT`, say the latency split is missing rather than estimating one.
+   Report the per-engine artifacts in `profile_topN_by_role` and `profile_workload_by_role` — the
+   second is not optional bookkeeping: the Kernel Extractor builds each head's unittest against the
+   workload model of the engine that head runs on, and with only the merged path it would build a
+   decode head against prefill shapes. Say in `notes` which engine each head came from. If one engine produced no trace (the gate's report says so), profile and tune the one that
+   did and state plainly that the other is unprofiled — never infer the missing engine's table from the
+   present one. `CHUNK`/`CAPTURE_SIZES` are per engine: read them from that engine's own server log
+   (`server.log` is rank0/prefill, `server.rank1.log` is rank1/decode).
+
    Pass `--isl/--osl/--conc` (the SAME values as the bench). IF the trace carries `gpu_user_annotation`
    `execute_*` step spans, each top kernel is annotated with its MEASURED serving **phase**
    (`prefill`/`decode`/`both`), per-phase `base_latency_ms`, and a top-level `serving` block with the
@@ -249,6 +290,11 @@ Return JSON:
   "round": 0,
   "profile_topN_json": "<EVAL_DIR>/profile/round_0/profile_topN.json",
   "profile_topN_md": "<EVAL_DIR>/profile/round_0/profile_topN.md",
+  "profile_topN_by_role": {"prefill": "<...>/profile_topN_prefill.json",
+                           "decode": "<...>/profile_topN_decode.json"},
+  "profile_workload_by_role": {"prefill": "<...>/profile_workload_prefill.json",
+                               "decode": "<...>/profile_workload_decode.json"},
+
   "profile_roofline_json": "<EVAL_DIR>/profile/round_0/profile_roofline.json  (\"\" if no analysis skill ran)",
   "source": "torch-trace|merged|tracelens|tracelens+trace",
   "total_gpu_time_ms": 0.0,

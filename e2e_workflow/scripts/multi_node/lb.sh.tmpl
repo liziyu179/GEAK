@@ -1,0 +1,35 @@
+# Load-balancer launch for prefill/decode disaggregation, rendered by
+# `mn.py launch` and executed ON the master node by a pinned Ray task.
+#
+# WHY THIS IS NOT serve.sh.tmpl: that template exists to tell a process facts
+# about the NODE it landed on -- which NIC the collectives must use, who the
+# master is, which cards are its own. The load balancer has none of those
+# concerns: it owns no GPU, joins no collective, and reaches the two engines at
+# addresses this file is handed outright. Rendering it through the per-rank
+# template would mean giving it a rank and a device list it must then be trusted
+# to ignore. So the node-fact probe deliberately does NOT appear here, and that
+# is not a second copy of it: there is nothing here to probe.
+#
+# Placeholders are all mandatory; `mn.py launch` refuses to launch if any
+# survives the render.
+set -e
+
+mkdir -p "$(dirname __LOG__)"
+echo "mn-launch id=__LAUNCH_ID__ role=lb host=__LB_HOST__ port=__LB_PORT__ prefill=__PREFILL_URL__ decode=__DECODE_URL__ log=__LOG__"
+
+# The adapter contract, reduced to what a front end needs. MODEL is here because
+# the LB answers /get_model_info and /v1/models on the engines' behalf, and
+# asking a worker that is still loading weights is how that endpoint starts
+# returning 503 in the middle of a warmup.
+export MODEL=__MODEL__
+export LOG=__LOG__
+export PYTHONPATH=__PYTHONPATH__
+export EXTRA_ENV="__EXTRA_ENV__"
+export LB_EXTRA_ARGS="__LB_EXTRA_ARGS__"
+# Its own session, so reaping the LB cannot take this script's group with it.
+export SERVER_LAUNCH_PREFIX=setsid
+
+# HOW this framework spells "load balance one prefill and one decode".
+. "__ADAPTER__"
+adapter_pd_lb_launch __LB_HOST__ __LB_PORT__ __PREFILL_URL__ __BOOTSTRAP_PORT__ __DECODE_URL__
+echo STARTED_PID=$SERVER_PID

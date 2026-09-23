@@ -57,7 +57,6 @@ must not fight:
   therefore caught at smoke, not after authoring.
 * **The denominator is the same one the e2e gate uses**, so isolated speedup and `e2e_delta_pct` are
   measured on the same basis and the Amdahl cross-check is meaningful.
-
 **`cases.py` — the one file you author, and the only thing the two legs share besides the runner.**
 It must import NOTHING from the task dir except `harness_lib` (passed in as `h`), and must reach the op
 ONLY through `meta.target_callable` — never through a path, and never by importing `kernel_src/`
@@ -172,7 +171,13 @@ freeze an out-of-regime oracle nobody should trust.
    cp -r "$CURRENT_OVERLAY"/. "$TASK/baseline_overlay"/ 2>/dev/null || \
      python3 -c "import sys;sys.path.insert(0,'$SKILL_DIR/scripts');import overlay_setup as o;o._ensure_overlay('$TASK/baseline_overlay')"
 
-   BACKEND="<backend>" OUT_DIR="$TASK/_capture" GPU="$GPU_ID" MODEL="$MODEL_PATH" \
+   # BENCH_LAUNCHER=native is REQUIRED, not decoration: this is ISOLATED single-GPU work (one card from
+   # the optimization pool, TP=1), but BENCH_LAUNCHER is inherited from the run env, so on a run whose
+   # SERVING legs use a multi-machine launcher the capture inherits it and aborts before the server
+   # starts — that launcher requires a machine pin and a TP group spanning every pinned node, which a
+   # one-card capture cannot satisfy. Pinning native is a no-op on a natively-served run.
+   BACKEND="<backend>" BENCH_LAUNCHER=native \
+   OUT_DIR="$TASK/_capture" GPU="$GPU_ID" TP=1 MODEL="$MODEL_PATH" \
    ISL=<WORKLOAD.isl> OSL=<WORKLOAD.osl> CONC=<WORKLOAD.conc> REPEATS=0 PROFILE=0 \
    OVERLAY_PYTHONPATH="$TASK/_capture_overlay" \
    EXTRA_ENV="CAPTURE_TARGET=<selected module:attr> CAPTURE_OUT=$TASK CAPTURE_MAX=5 GEAK_SELECTION_TRACE=$TASK/selection_trace.json CAPTURE_BYTE_BUDGET=${CAPTURE_BYTE_BUDGET:-8GiB} CAPTURE_CASE_BYTE_LIMIT=${CAPTURE_CASE_BYTE_LIMIT:-2GiB} CAPTURE_PERSIST_POLICY=${CAPTURE_PERSIST_POLICY:-share_large}" \
@@ -659,11 +664,25 @@ needs an op task dir the **Op Benchmarker** can bake-off across backends. `edit=
 >   reduce, one dispatcher call), NOT per-GEMM stages timed in isolation — the fusion boundary, the
 >   intermediate-activation residency, and the reduce are part of the op being optimized/measured.
 
+> **🔴 PD-disaggregated serving (`SERVING_ENGINE` is in your inputs, value `prefill` or `decode`) — the
+> both-regimes rule INVERTS, and following the colocated rule here is wrong, not merely conservative.**
+> Colocated, one kernel serves prefill AND decode, so the unittest must span both or a head tuned on the
+> GPU-time-dominant prefill M regresses decode. Disaggregated, they are **different machines**: this
+> kernel runs on the `SERVING_ENGINE` engine and **never sees the other regime's shape**. So build the
+> case set for THAT engine only — the orchestrator already sets `REQUIRE_DECODE_BUCKET` and
+> `PREFILL_M_NOTE` accordingly, and `PROFILE_WORKLOAD_JSON` is already that engine's own model (the
+> Profiler parses each engine's rank-0 trace separately). Adding the other engine's M spends the search
+> on a shape this kernel never runs and can pick a config that loses on the one it does. Pass
+> `--served-regimes` to `attribute_weights.py` as that engine's regime (`prefill` → `prefill`, `decode`
+> → `decode`), and record `SERVING_ENGINE` in `meta.json`/`notes` so the A/B that follows is read as a
+> statement about that engine, not about the server.
+
 Inputs: `EVAL_DIR`, `MODEL_PATH`, `GPU_ID`, `WORKLOAD`, `KERNEL` (Architect head candidate: short_name,
 op_kind=gemm|attn, the profiled `shapes`, dtype, regime, `target_callable` for attn, and OPTIONAL
 TraceLens `source_hint`/`launcher_hint`/`bound_type`), `GEMM_SYNTH` (bool, default true),
-`CURRENT_FLAGS`/`CURRENT_ENV`, `SKILL_DIR`, and OPTIONAL `PROFILE_WORKLOAD_JSON` (the profiler's
-per-(shape,dtype) weighted workload model — slice this kernel's cases into `workload_path`, see below).
+`CURRENT_FLAGS`/`CURRENT_ENV`, `SKILL_DIR`, OPTIONAL `PROFILE_WORKLOAD_JSON` (the profiler's
+per-(shape,dtype) weighted workload model — slice this kernel's cases into `workload_path`, see below),
+and OPTIONAL `SERVING_ENGINE` (`prefill`/`decode` under PD disaggregation — see the box above).
 
 > **TraceLens shape double-check (mandatory when the shapes came from TraceLens).** If `KERNEL.shapes`
 > originated from the upstream `analysis.md`/`kernel_candidates.json` prior, treat them ONLY as a

@@ -28,9 +28,9 @@ Schema (json):
      "rank", "name", "short_name", "calls", "total_ms", "avg_us", "pct_gpu_time",
      "shapes": [[...dims...], ...],          # up to 5 distinct input-dim sets
      "dtypes": [...],                        # distinct input dtypes seen
-     "classification": "triton|library_gemm|library_attn|fused_custom|"
+     "classification": "triton|library_gemm|library_attn|fused_custom|comm|"
                        "elementwise_overhead|reduction_norm|memory|other",
-     "backend_guess": "triton|hipblaslt|aiter|ck|rocblas|torch_native|unknown",
+     "backend_guess": "triton|hipblaslt|aiter|ck|rocblas|torch_native|rccl|unknown",
      "editable": bool,                       # can a source-level kernel swap touch it?
      "opt_hint": str
   } ... ]
@@ -47,6 +47,23 @@ from collections import defaultdict
 # Each entry: (regex, classification, backend_guess, editable, hint)
 # --------------------------------------------------------------------------- #
 RULES = [
+    # Collectives go FIRST, and that placement is load-bearing. 'AllReduce' contains 'reduce', so
+    # without this rule an RCCL kernel falls into the reduction_norm rule below and is reported as an
+    # editable Triton norm -- which sends the Architect looking for a source-level rewrite of a library
+    # collective that has no source on this box. A fused allreduce+rmsnorm also carries 'aiter' in its
+    # name; landing it here is still right, because the op IS the collective.
+    #
+    # editable=False for the same reason library_gemm is: there is no source to rewrite. That is NOT
+    # "skip" -- for a collective the lever was never the kernel body. It is which all-reduce
+    # IMPLEMENTATION is dispatched and how many bytes it puts on the wire, which is selected by env at
+    # the live seam. See perf_knowledge/operators/allreduce/overview.md for the ladder.
+    (r"nccl|rccl|cross_device_reduce|(?<![a-z])all[_]?(?:reduce|gather|to[_]?all)|"
+     r"reduce[_]?scatter|custom[_]?all[_]?reduce|quick[_]?reduce|(?<![a-z])barrier",
+     "comm", "rccl", False,
+     "Collective (TP/EP all-reduce, all-gather, reduce-scatter). No source to rewrite; the levers are "
+     "the AR implementation (RCCL vs custom 1-shot/2-shot vs quantized QuickReduce), byte-reduction on "
+     "the wire, comm-compute overlap, and AR+RMSNorm fusion. Route as an op_select lever, not a "
+     "kernel rewrite and not a plain config parameter."),
     (r"triton|_kernel_0d1d|tt\.|fused_.*kernel", "triton", "triton", True,
      "Triton kernel — extractable; try Triton tuning, or a CK/HIP rewrite if memory/compute bound."),
     (r"Cijk|Tensile|hipblaslt|_gemm|GemmEx|gemm_|hgemm|sgemm|f16_gemm|igemm",

@@ -232,6 +232,57 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(pp.classify("TRITON_FOO")[0], "triton")
 
 
+class TestCollectiveClassification(unittest.TestCase):
+    """A collective must not be reported as an editable Triton norm.
+
+    'AllReduce' contains 'reduce', so before the comm rule existed an RCCL kernel matched the
+    reduction_norm rule and came back ("reduction_norm", "triton", editable=True) -- which points the
+    Architect at a source rewrite of a library collective that has no source on the box. On multi-node
+    TP this is the single largest row in the profile, so getting its identity wrong is expensive.
+    """
+
+    def test_the_real_rccl_symbols_are_comm_and_not_editable(self):
+        for name in ("ncclDevKernel_AllReduce_Sum_bf16_RING_LL(ncclDevKernelArgsStorage<4096ul>)",
+                     "ncclDevKernel_AllGather_RING_LL",
+                     "ncclDevKernel_ReduceScatter_Sum_f32_RING_LL",
+                     "cross_device_reduce_2stage",
+                     "cross_device_reduce_1stage",
+                     "custom_all_reduce_kernel",
+                     "rccl_all_reduce"):
+            with self.subTest(name=name):
+                cls, backend, editable, hint = pp.classify(name)
+                self.assertEqual((cls, backend, editable), ("comm", "rccl", False))
+                self.assertIn("op_select", hint)
+
+    def test_the_reduce_substring_no_longer_steals_collectives(self):
+        # The regression this rule exists for, pinned by name.
+        self.assertNotEqual(pp.classify("ncclDevKernel_AllReduce_Sum_bf16_RING_LL")[0],
+                            "reduction_norm")
+
+    def test_a_fused_allreduce_norm_is_comm_not_aiter_custom(self):
+        # Carries 'aiter' too, and the aiter rule would claim it if comm did not come first. Landing
+        # it in comm is right: the op IS the collective, and its lever is the AR implementation.
+        cls, backend, editable, _ = pp.classify("aiter::fused_allreduce_rmsnorm")
+        self.assertEqual((cls, backend, editable), ("comm", "rccl", False))
+
+    def test_ordinary_norms_and_reductions_are_untouched(self):
+        # The comm rule must not widen into the reduction_norm family it sits in front of.
+        for name, want in (("rms_norm_forward", "reduction_norm"),
+                           ("layernorm_fwd", "reduction_norm"),
+                           ("softmax_warp_forward", "reduction_norm"),
+                           ("at::native::reduce_kernel", "reduction_norm"),
+                           ("Cijk_Alik_Bljk_HHS_BH", "library_gemm"),
+                           ("flash_fwd_splitkv", "library_attn")):
+            with self.subTest(name=name):
+                self.assertEqual(pp.classify(name)[0], want)
+
+    def test_a_word_ending_in_all_does_not_become_a_collective(self):
+        # The lookbehind exists so 'smallgather'/'installreduce'-shaped names cannot match
+        # 'all[_]?gather' / 'all[_]?reduce' on a substring.
+        self.assertNotEqual(pp.classify("smallgather_kernel")[0], "comm")
+        self.assertNotEqual(pp.classify("install_reduce_helper")[0], "comm")
+
+
 class TestShortNameAndNormKey(unittest.TestCase):
     def test_strips_void_template_and_namespace(self):
         self.assertEqual(pp.short_name(GEMM), "gemm_kernel")

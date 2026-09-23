@@ -86,6 +86,21 @@ verified_isolated_speedup, pct_gpu_time; for a HEAD-op winner also: `op_kind`, `
 ∈ {env,flag,patch}, `apply_env`, `apply_flags`, `code_patch`, `tuning_artifact`, `parity_note`),
 `CURRENT_OVERLAY`, `CURRENT_FLAGS`/`CURRENT_ENV`, `CURRENT_THROUGHPUT`, `SKILL_DIR`.
 
+**PD disaggregation: the change goes to ONE engine (only if `SERVING_ENGINE` is in your inputs).**
+The kernel was extracted and measured on `SERVING_ENGINE`'s shapes only; the other engine runs the
+same function at a different M that nobody measured. So:
+- `CURRENT_OVERLAY` is already THAT engine's own overlay (possibly empty), not the shared one. Seed the
+  candidate from it exactly as below. `SHARED_OVERLAY` is the layer both engines get — pass it as
+  `OVERLAY_PYTHONPATH` on BOTH legs, unchanged, and never copy it into the candidate.
+- Reference leg: `<ENGINE_OVERLAY_VAR>="$CURRENT_OVERLAY"` (omit when empty). Candidate leg:
+  `<ENGINE_OVERLAY_VAR>="$CAND"`. The launcher renders it ahead of the shared overlay on that engine
+  only; the other engine is identical in both legs, so the delta is this engine's change alone.
+- An `env` / `flag` winner goes in `<ENGINE_ENV_VAR>` / `<ENGINE_ARGS_VAR>` on the candidate leg, merged
+  key by key with the value already in your inputs — not in `EXTRA_ENV` / `EXTRA_SERVER_ARGS`.
+- Engagement is proven in `ENGINE_LOG` (`server.log` = prefill, `server.rank1.log` = decode). Absence
+  of the marker in the OTHER engine's log is expected; presence there means the overlay leaked.
+- `accepted_overlay` is the candidate dir (`$CAND`), i.e. the new overlay for this engine only.
+
 **ACCURACY GATE (only if `ACCURACY_GATE=gsm8k` is in your inputs; else use the normal parity gate).**
 For a QUANTIZED kernel, byte-exact greedy parity is the WRONG bar (a within-tolerance kernel rounds
 differently → flips borderline argmaxes → over-rejects valid kernels). Instead, score TASK ACCURACY:
@@ -389,6 +404,11 @@ win**: `TUNING_DEPLOY_BUNDLE`, `TUNING_APPLY_ENV`, `TUNING_CACHE_INVALIDATION`, 
    `final_patch.diff` (all accepted kernel patches), and a `final_launch.sh` that reproduces the
    optimized server (sets `BACKEND=<backend>`, `PYTHONPATH=<overlay>`, the accepted flags/env, and runs
    the bench via bench_e2e.sh + its adapter). This is the spec deliverable: "complete patch + launch/benchmark script".
+   When Inputs contain `GEAK_MN_PD_SWEEP_ARGS_PREFILL` / `_DECODE`, the matching `GEAK_MN_PD_SWEEP_ENV_*`
+   or `GEAK_MN_PD_OVERLAY_*`, `final_launch.sh` exports those beside `EXTRA_SERVER_ARGS` /
+   `OVERLAY_PYTHONPATH`. They were accepted for one engine only. Do not fold them into the shared
+   variables — those are applied to both engines. `final_patch.diff` lists each engine's patches under
+   its own heading, so a reader can tell which machine a patch runs on.
 
 1b. **Fold in the tuning deploy bundle** (only when `TUNING_DEPLOY_BUNDLE` is present).
 

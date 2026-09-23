@@ -12,6 +12,27 @@ the kernel result (`apply_env`/`code_patch`), applied at integrate regardless of
 After your wins, the profile is re-taken because you change
 which kernels dominate.
 
+**`SWEEP_SCOPE` tells you which of two jobs you are doing, and you must not blur them.**
+
+- `all` — the normal exploratory sweep over every direction the Architect ranked.
+- `op_select_only` — `CONFIG_TUNE_ENABLED=false`, so parameter search is OUT OF SCOPE, but the
+  `config_directions` you were handed are all `lever_kind: "op_select"`: the choice of **which
+  implementation of an operator runs**. Same principle as the kernel-engagement switch above — the
+  caller disabled parameter hunting, not the right of an op to run on something other than its slow
+  default. The case this exists for is **collectives**: an all-reduce has no meaningful isolated
+  single-GPU form, so the head track cannot bench it, and the live stack is the only place its
+  implementation can be chosen. On multi-node TP it can be the largest single consumer of GPU time.
+  In this mode: sweep ONLY the directions you were given, and **do not add axes of your own** — not
+  batching, not memory fraction, not scheduling, not cuda-graph, however tempting the profile looks.
+  If a direction you were handed is plainly an ordinary parameter rather than an implementation choice,
+  skip it and say so in `trials` with `skipped_reason: "mistagged_op_select"` rather than running it.
+  Everything else below (one axis at a time, noise band, parity, verify-it-engaged) applies unchanged —
+  and parity matters MORE here, because **quantized all-reduce changes reduced values**: int8/int6/int4/
+  fp8 on the wire is an accuracy gate, not a free win. Read
+  `perf_knowledge/operators/allreduce/numerics.md` before accepting one, and verify engagement from the
+  server log rather than from throughput alone (a comm env that silently fails to bind looks exactly
+  like a no-win).
+
 You are invoked per PHASE. Read first: `SKILL_DIR/knowledge/e2e_optimization.md` (Tier 0 knobs),
 `SKILL_DIR/knowledge/sglang_internals.md` (the exact flags/env + how to verify a swap took effect),
 `SKILL_DIR/knowledge/backend_playbook.md` (which backend the Architect ranked for each shape), and
@@ -36,7 +57,8 @@ e.g. `--attention-backend triton`).
 
 Inputs: `EVAL_DIR`, `MODEL_PATH`, `BACKEND` (sglang|vllm), `GPU_ID`, `WORKLOAD`,
 `BASELINE_THROUGHPUT`, `NOISE_BAND_PCT`, `CONFIG_DIRECTIONS` (the Architect's ranked axes + swaps,
-each with target kernels + rationale), `CURRENT_FLAGS`/`CURRENT_ENV`/`CURRENT_OVERLAY`
+each with target kernels + rationale), `SWEEP_SCOPE` (`all` | `op_select_only` — see above),
+`CURRENT_FLAGS`/`CURRENT_ENV`/`CURRENT_OVERLAY`
 (the accepted stack so far),
 `MEASUREMENT_MODE`, `MEASUREMENT_PURPOSE`, `REPLICAS`, `EFFECTIVE_CONFIG_DIGEST`,
 `ENABLE_FP8` (bool; gates the FP8 axis), `SKILL_DIR`. On a warm-start replay you additionally get
@@ -56,17 +78,39 @@ For EACH direction, in the Architect's order:
    (and by `env`) as last-wins, so a duplicated key hands the outcome to the order you happened to
    write the string in, and the losing value vanishes with nothing in any log to say it did.
    The only exception is a genuinely repeatable flag such as `--lora-path`.
+
+   **PD disaggregation (`engine` is `prefill` or `decode`, or the Top-N has a `per_role` block).**
+   `EXTRA_SERVER_ARGS` / `EXTRA_ENV` are applied to both engines. A direction whose `engine` is
+   `prefill` or `decode` is merged only into that engine's sweep, never into the shared string:
+   `GEAK_MN_PD_SWEEP_ARGS_PREFILL` / `GEAK_MN_PD_SWEEP_ARGS_DECODE` and the matching
+   `GEAK_MN_PD_SWEEP_ENV_*`. A direction with `engine` empty stays in the shared string because
+   the same value belongs on both. On a trial, change only the engine that direction names; pass
+   the other engine's already-accepted sweep through unchanged. Record `engine` on the trial.
 2. Launch + bench via the shared script:
    ```bash
    # SERVING config MUST match the run-wide invariant: TP=SERVING_TP GPU=SERVING_GPU (from your inputs).
+   # PD: export GEAK_MN_PD_SWEEP_ARGS_<ROLE> / GEAK_MN_PD_SWEEP_ENV_<ROLE> for each engine that has
+   # an accepted (or this trial's candidate) value. Omit a variable that is empty. Do not copy a
+   # one-engine flag into EXTRA_SERVER_ARGS — that string is appended on both machines.
    BACKEND="<backend>" OUT_DIR="$EVAL_DIR/config/<dir_id>" GPU="<SERVING_GPU>" TP="<SERVING_TP>" MODEL="$MODEL_PATH" \
    ISL=<isl> OSL=<osl> CONC=<conc> PROFILE=0 \
    GEAK_REPEAT_MODE="$MEASUREMENT_MODE" MEASUREMENT_PURPOSE=search REPLICAS="${REPLICAS:-1}" \
-   OVERLAY_PYTHONPATH="$CURRENT_OVERLAY" EXTRA_SERVER_ARGS="<current flags, merged with this flag>" EXTRA_ENV="<current env, merged with this env>" \
+   OVERLAY_PYTHONPATH="$CURRENT_OVERLAY" \
+   EXTRA_SERVER_ARGS="<shared flags>" EXTRA_ENV="<shared env>" \
+   GEAK_MN_PD_SWEEP_ARGS_PREFILL="<prefill flags>" GEAK_MN_PD_SWEEP_ARGS_DECODE="<decode flags>" \
+   GEAK_MN_PD_SWEEP_ENV_PREFILL="<prefill env>" GEAK_MN_PD_SWEEP_ENV_DECODE="<decode env>" \
      bash "$EVAL_DIR/bench_e2e.sh" 2>&1 | tee "$EVAL_DIR/logs/cfg_<dir_id>.log"
    ```
 3. Read `bench_summary.json`. delta% = `(cand_median - current_median)/current_median*100`.
-4. Parity check if numerics could change. Verify the swap took (server log).
+4. Parity check if numerics could change. Verify the swap took (server log). **PD: read the log of
+   the engine the direction names** — `server.log` is the prefill engine (rank0),
+   `server.rank1.log` is decode — for evidence the framework actually USED the value (backend
+   chosen, batch size captured). Which engine the flag REACHED is not a log question:
+   `mn_launch.json` records `pd.effective_args_by_role` (each engine's composed args and env) and
+   `pd.sweep_leaks` (one-engine keys that also sit in the shared string). A non-empty
+   `sweep_leaks` means the trial measured both engines changing: fix the strings and re-run it.
+   The orchestrator also moves a kept one-engine value out of `accepted_flags`/`accepted_env`
+   on accept, but a trial measured with the leak is still the wrong measurement.
 5. Keep the change ONLY if delta% > noise band AND parity passes. Accepted changes COMPOUND into the
    running config for subsequent directions.
 6. (GEMM tuning is NOT a config axis — it lives in the head-kernel track now.)
@@ -121,12 +165,17 @@ Return JSON:
 ```json
 {
   "trials": [
-    {"id": "cfg0", "axis": "attention-backend", "change": "--attention-backend aiter",
+    {"id": "cfg0", "axis": "attention-backend", "engine": "prefill|decode|\"\"",
+     "change": "--attention-backend aiter",
      "throughput_tok_s": 0.0, "delta_pct": 0.0, "parity": "pass|fail|n/a",
      "swap_verified": true, "kept": true, "note": "..."}
   ],
-  "accepted_flags": "<final kept extra server flags>",
-  "accepted_env": "<final kept extra env KEY=VAL ...>",
+  "accepted_flags": "<shared flags, applied to both engines>",
+  "accepted_env": "<shared env KEY=VAL ..., applied to both engines>",
+  "accepted_flags_by_role": {"prefill": "<flags accepted for the prefill engine only>",
+                             "decode": "<flags accepted for the decode engine only>"},
+  "accepted_env_by_role": {"prefill": "<KEY=VAL accepted for prefill only>",
+                           "decode": "<KEY=VAL accepted for decode only>"},
   "best_throughput_tok_s": 0.0,
   "throughput_speedup_vs_baseline": 1.0,
   "summary": "what worked, what didn't, what to re-profile against",

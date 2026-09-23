@@ -166,6 +166,22 @@ it), the correctness and engagement evidence, and the pre/post A/B — naming th
 that produced it, since the lifecycle is part of the number. The System Architect quotes this in the
 final report, so put real numbers in it and mark absent things as absent.
 
+### PD disaggregation (only if `SERVING_TOPOLOGY=pd_disagg` is in your inputs)
+
+Prefill and decode are separate servers, and an op on the merged Top-N carries a `role` saying which
+one it ran on. Tune it on THAT engine's shapes (its own `profile_workload_<role>.json`), put `engine`
+on its `ops_tuned` entry, and deploy it to that engine only:
+- A routing/dispatch overlay that only one engine should load goes in `apply_overlay_by_role.<role>`,
+  not `apply_overlay` — the shared overlay is imported by both servers, and the other one runs the
+  rerouted op at an M this tune never saw.
+- Env / flags that bind one engine's artifact go in `apply_env_by_role.<role>` /
+  `apply_flags_by_role.<role>`. A shape-keyed table (e.g. a GEMM config CSV) is safe in the shared
+  `apply_env`: the other engine's M does not match its rows and falls back to the default. Say which
+  you chose and why in `tuning_report.md`.
+- In your A/B pass the per-engine part as `GEAK_MN_PD_OVERLAY_<ROLE>` / `GEAK_MN_PD_SWEEP_ENV_<ROLE>` /
+  `GEAK_MN_PD_SWEEP_ARGS_<ROLE>`, merged with any value already in your inputs. Prove engagement in
+  that engine's log: `server.log` is prefill, `server.rank1.log` is decode.
+
 ### Return JSON
 
 **Write this same object to `EVAL_DIR/tuning/tuning_result.json` BEFORE you return it, byte-identical.**
@@ -195,6 +211,9 @@ soon as the gate is decided, before writing the report — if you can only do on
   "apply_overlay": "<overlay dir with the routing/dispatch code change, or \"\" if none was needed>",
   "apply_env": "<env the deploy REQUIRES, KEY=VAL ...>",
   "apply_flags": "<flags the deploy requires>",
+  "apply_overlay_by_role": {"prefill": "<PD only: overlay for that engine alone>", "decode": ""},
+  "apply_env_by_role": {"prefill": "", "decode": "<PD only: KEY=VAL for that engine alone>"},
+  "apply_flags_by_role": {"prefill": "", "decode": ""},
   "cache_invalidation": ["commands that MUST run after install or the artifact is silently ignored"],
   "correctness_gate": "pass|fail|skipped",
   "accuracy_note": "...",
