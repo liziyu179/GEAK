@@ -63,11 +63,11 @@ def _short(hostname: str) -> str:
 # torch.distributed world. Every A/B leg runs on the same pin.
 
 # Bracket classes keep pgrep from matching the `bash -c` that carries the pattern.
-SERVE_PATTERN = "(sglang[ ]serve|sglang[.]launch_server|vllm[ ]serve)"
+SERVE_PATTERN = "(sglang[ ]serve|sglang[.]launch_server|vllm[ ]serve|atom[.]entrypoints[.]openai_server)"
 SCHED_PATTERN = "sglang::[s]cheduler"
-# Engine children rename themselves (sglang::scheduler, VLLM::Worker_TP3, VLLM::EngineCore)
-# and can outlive the serve process, holding the cards.
-ENGINE_PATTERN = "(sglang|VLL[M])::"
+# Engine children rename themselves (sglang::scheduler, VLLM::Worker_TP3, VLLM::EngineCore,
+# ATOM::<name>: ATOM_PROCESS_NAME_PREFIX) and can outlive the serve process, holding the cards.
+ENGINE_PATTERN = "(sglang|VLL[M]|ATO[M])::"
 # Without setproctitle the same children keep their multiprocessing argv; orphaned
 # (ppid 1) they hold the cards and the dist-init port after the serve process is gone.
 WORKER_PATTERN = "multiprocessing[.](spawn import spawn_main|resource_tracker import main)"
@@ -78,7 +78,7 @@ OUR_WORKER_PIDS = (
 # Separate from SERVE_PATTERN: the LB holds no GPU. The router rewrites its argv
 # to "sglang::router"; the mini-LB keeps its module path. No literal "sglang::" here:
 # ENGINE_PATTERN's pkill would match the `bash -c` that carries this pattern and kill it.
-LB_PATTERN = "(sglang:[:]router|sglang_router[.]mini_lb)"
+LB_PATTERN = "(sglang:[:]router|sglang_router[.]mini_lb|atomesh[ ]launch)"
 
 # A rank's server pid, recorded on its own node (a pid means nothing elsewhere) with the
 # process's start time, so a pid the kernel has since handed to another process is not ours.
@@ -146,7 +146,8 @@ PD_LBS = ("router", "minilb")
 
 # What a caller's engine launch_command says about the deployment, per backend: check
 # reconciles it with the handoff, launch strips these flags from GEAK's swept ones (the
-# caller's command owns them). --port is read from every command.
+# caller's command owns them). The HTTP port is read from every command: --port, unless the
+# backend names another flag ("port").
 ENGINE_CMD_FACTS = {
     "sglang": {"model": ("--model-path", "--model"), "tp": ("--tp-size", "--tp"),
                "role": ("--disaggregation-mode",), "bootstrap": ("--disaggregation-bootstrap-port",),
@@ -155,9 +156,17 @@ ENGINE_CMD_FACTS = {
     "vllm": {"model": ("--model",), "tp": ("--tensor-parallel-size", "-tp"),
              "role": ("--kv-transfer-config",), "bootstrap": (),
              "other": ("--host", "--pipeline-parallel-size", "-pp")},
+    # ATOM: --server-port is the HTTP port a router dials; --port is the engine's internal one,
+    # which the caller's command owns too. The role rides in --kv-transfer-config like vllm's,
+    # and the Mooncake handshake needs no bootstrap port after the router's --prefill URL.
+    "atom": {"model": ("--model",), "tp": ("--tensor-parallel-size", "-tp"),
+             "role": ("--kv-transfer-config",), "bootstrap": (), "port": ("--server-port",),
+             "port_default": 8000,   # api_server's DEFAULT_PORT: a command with no --server-port serves here
+             "other": ("--host", "--port", "--data-parallel-size", "--pipeline-parallel-size")},
 }
 SGLANG_BOOTSTRAP_PORT = 8998
-VLLM_KV_ROLES = {"kv_producer": "prefill", "kv_consumer": "decode"}
+KV_ROLES = {"kv_producer": "prefill", "kv_consumer": "decode"}
+KV_CONFIG_BACKENDS = ("vllm", "atom")   # the PD role is a JSON --kv-transfer-config
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -182,7 +191,8 @@ def flag_value(argv: list, names) -> str | None:
 
 def structural_flags(backend: str) -> set:
     facts = ENGINE_CMD_FACTS[backend]
-    return {"--port", *facts["model"], *facts["tp"], *facts["role"], *facts["bootstrap"], *facts["other"]}
+    return {"--port", *facts.get("port", ()), *facts["model"], *facts["tp"], *facts["role"],
+            *facts["bootstrap"], *facts["other"]}
 
 
 def strip_flags(args: str, flags: set) -> tuple[str, list[str]]:
@@ -203,7 +213,7 @@ def strip_flags(args: str, flags: set) -> tuple[str, list[str]]:
 def engine_facts(backend: str, command: str) -> dict:
     """Model, TP, port, PD role and bootstrap port an engine command serves with. Raises ValueError."""
     if backend not in ENGINE_CMD_FACTS:
-        raise ValueError(f"a launch_command needs backend sglang or vllm, got {backend!r}")
+        raise ValueError(f"a launch_command needs backend {', '.join(ENGINE_CMD_FACTS)}, got {backend!r}")
     facts = ENGINE_CMD_FACTS[backend]
     env, argv = split_command(command)
     owned = sorted({kv.split("=", 1)[0] for kv in env} & _OWNED)
@@ -214,14 +224,17 @@ def engine_facts(backend: str, command: str) -> dict:
         nxt = argv.index("serve") + 1
         model = argv[nxt] if nxt < len(argv) and not argv[nxt].startswith("-") else None
     role = flag_value(argv, facts["role"])
-    if backend == "vllm" and role:
+    if backend in KV_CONFIG_BACKENDS and role:
         try:
-            role = VLLM_KV_ROLES.get(json.loads(role).get("kv_role"))
+            role = KV_ROLES.get(json.loads(role).get("kv_role"))
         except (ValueError, AttributeError):
             raise ValueError(f"--kv-transfer-config is not JSON: {role!r}") from None
-    port = flag_value(argv, ("--port",))
+    port_flags = facts.get("port", ("--port",))
+    port = flag_value(argv, port_flags)
+    if port is None and facts.get("port_default"):
+        port = str(facts["port_default"])
     if not (port or "").isdigit():
-        raise ValueError(f"launch_command names no --port: {command[:120]!r}")
+        raise ValueError(f"launch_command names no {port_flags[0]}: {command[:120]!r}")
     tp = flag_value(argv, facts["tp"]) or "1"
     boot = flag_value(argv, facts["bootstrap"]) if facts["bootstrap"] else None
     if backend == "sglang" and role == "prefill" and not boot:
@@ -233,7 +246,8 @@ def engine_facts(backend: str, command: str) -> dict:
 def _same_engine(backend: str, command: str) -> tuple:
     """A command with its --host/--port taken out: replicas of one role must agree on the rest."""
     env, argv = split_command(command)
-    return tuple(env), tuple(shlex.split(strip_flags(shlex.join(argv), {"--host", "--port"})[0]))
+    ports = {"--host", "--port", *ENGINE_CMD_FACTS[backend].get("port", ())}
+    return tuple(env), tuple(shlex.split(strip_flags(shlex.join(argv), ports)[0]))
 
 
 def url_tokens(command: str) -> set:
@@ -509,7 +523,7 @@ def _resident_gpu_pids(showpids: str) -> tuple[list[str], int]:
     return holders, parked
 
 
-SW_PACKAGES = ("sglang", "vllm", "torch", "triton", "amd-aiter")
+SW_PACKAGES = ("sglang", "vllm", "atom", "torch", "triton", "amd-aiter")
 
 
 def _versions() -> dict:
@@ -873,7 +887,7 @@ def engine_health(state: dict) -> list[dict]:
     A node whose probe does not come back over ssh raises: that is not a dead rank."""
     nodes = resolve(state)
     workers = (f"echo sched=$(pgrep -c -f '{SCHED_PATTERN}' || true) "
-               "zombie=$(ps -eo stat=,args= | awk '/(sglang|VLLM)::/ && $1 ~ /Z/' | wc -l)")
+               "zombie=$(ps -eo stat=,args= | awk '/(sglang|VLLM|ATOM)::/ && $1 ~ /Z/' | wc -l)")
     watch_lb = topology_of(state) == "pd_disagg"
     # A pin without a "pd" block takes pd_config's defaults; reading the raw key would probe port None.
     lb_port = pd_config(state)["lb_port"] if watch_lb else None
@@ -1485,6 +1499,16 @@ def launch_script(head: list, env: dict, adapter: str, call: str, structural: st
     return "\n".join(lines) + "\n"
 
 
+def atom_profile_dir(backend: str, profile_dir: str, role) -> str:
+    """Where one engine writes its traces. sglang and vllm are told per window (the request carries
+    the directory), so the profile dir is shared. ATOM fixes it at launch, and under PD the two
+    engines would both write `rank_0/` there: each role gets its own, which is the directory the
+    trace gate reads that role from."""
+    if backend == "atom" and role and profile_dir:
+        return os.path.join(profile_dir, role)
+    return profile_dir
+
+
 def rank_env_vars(*, model, tp, gpu, mem_fraction, port, base_url, log, profile_dir,
                   overlay, pythonpath, extra_env, extra_args) -> dict:
     """What bench_e2e.sh exports before adapter_launch. GPU is the PER-NODE list."""
@@ -1683,11 +1707,12 @@ def cmd_launch(argv: list) -> int:
                 print(f">>> multinode: rank{rank}: dropping {tok!r}; the launch_command owns it", file=sys.stderr)
         if pd is not None:
             effective_by_role[role] = {"extra_args": rank_extra, "env": " ".join(rank_env)}
+        rank_profile_dir = atom_profile_dir(backend, profile_dir, role_of.get(rank))
         rank_vars = rank_env_vars(model=model, tp=node["tp"],
                                   gpu=",".join(str(i) for i in node.get("gpu_ids") or range(node["gpus"])),
                                   mem_fraction=mem_fraction,
                                   port=port, base_url=base_url, log=rank_log,
-                                  profile_dir=profile_dir, overlay=overlay,
+                                  profile_dir=rank_profile_dir, overlay=overlay,
                                   pythonpath=pythonpath, extra_env=" ".join(rank_env),
                                   extra_args=rank_extra)
         if provided:
@@ -1695,9 +1720,11 @@ def cmd_launch(argv: list) -> int:
             with open(wrapper, "w", encoding="utf-8") as f:
                 f.write(command_script(backend, node["launch_command"], rank_env, adapters_dir(shared)))
             banner = f"mn-launch id={launch_id} rank={rank} command={wrapper} log={rank_log}"
-            head = [f"mkdir -p {shlex.quote(os.path.dirname(rank_log))} {shlex.quote(profile_dir)}",
+            head = [f"mkdir -p {shlex.quote(os.path.dirname(rank_log))} {shlex.quote(rank_profile_dir)}",
                     f"echo {shlex.quote(banner)}"]
             rank_vars.update(BACKEND=backend, **{k: env(k) for k in MAGPIE_PASSTHROUGH if env(k)})
+            if backend == "atom" and env("PROFILE") == "1":
+                rank_vars["ATOM_PROFILER_MORE"] = "1"   # the command's own env prefix still wins
             # The command is the whole recorded launch; magpie must not prepend the recipe's flags again.
             rank_vars["EFFECTIVE_SERVER_ARGS_COMPLETE"] = "1"
             scripts[rank] = provided_script(head, rank_vars, wrapper,
