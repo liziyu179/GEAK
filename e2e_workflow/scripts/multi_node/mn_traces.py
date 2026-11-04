@@ -45,12 +45,32 @@ KERNEL_EVENT = rb'"cat": ?"kernel"'
 
 TRACE_RE = re.compile(r"TP-(\d+)")
 DP_RE = re.compile(r"DP-(\d+)")
+# ATOM names no rank in the file: each rank writes into its own directory under the profile
+# dir, `rank_<N>/`, or `dp<D>_tp<N>/` under data parallelism.
+ATOM_RANK_DIR_RE = re.compile(r"^(?:rank_(?P<rank>\d+)|dp(?P<dp>\d+)_tp(?P<tp>\d+))$")
+TRACE_PATTERNS = ("*.trace.json.gz", "*.trace.json", "*.json.gz")
 
 
 def discover(profile_dir: str) -> list[str]:
-    files = [f for pattern in ("*.trace.json.gz", "*.trace.json", "*.json.gz")
-             for f in glob.glob(os.path.join(profile_dir, pattern))]
+    dirs = [profile_dir] + [d for d in glob.glob(os.path.join(profile_dir, "*"))
+                            if os.path.isdir(d) and ATOM_RANK_DIR_RE.match(os.path.basename(d))]
+    files = [f for d in dirs for pattern in TRACE_PATTERNS for f in glob.glob(os.path.join(d, pattern))]
     return sorted(set(f for f in files if not os.path.basename(f).startswith("merged-")))
+
+
+def rank_of(path: str) -> tuple:
+    """(TP rank, DP rank) of one trace, None where the path does not say. sglang puts them in the
+    file name (`...-TP-3-...`); ATOM in the directory the file sits in (`rank_3`, `dp1_tp3`)."""
+    name = os.path.basename(path)
+    tp, dp = TRACE_RE.search(name), DP_RE.search(name)
+    if tp:
+        return int(tp.group(1)), int(dp.group(1)) if dp else None
+    atom = ATOM_RANK_DIR_RE.match(os.path.basename(os.path.dirname(path)))
+    if atom and atom.group("rank") is not None:
+        return int(atom.group("rank")), None
+    if atom:
+        return int(atom.group("tp")), int(atom.group("dp"))
+    return None, int(dp.group(1)) if dp else None
 
 
 def scan(path: str) -> dict:
@@ -155,16 +175,15 @@ def cmd_trace_gate(argv: list) -> int:
     per_rank, unranked = {}, []
     for role, directory, node, _exp in lanes:
         for path in discover(directory):
-            name = os.path.basename(path)
-            match, dp = TRACE_RE.search(name), DP_RE.search(name)
+            tp_rank, dp_rank = rank_of(path)
             scanned = scan(path)
-            scanned["dp_rank"] = int(dp.group(1)) if dp else None
+            scanned["dp_rank"] = dp_rank
             if role:
                 scanned["role"] = role
-            if not match:
+            if tp_rank is None:
                 unranked.append(scanned)
                 continue
-            rank = int(match.group(1))
+            rank = tp_rank
             scanned["tp_rank"] = rank
             scanned["node_index"] = (lane_node(spans[role][0], rank, spans[role][1])
                                      if role in spans and len(spans[role][0]) > 1

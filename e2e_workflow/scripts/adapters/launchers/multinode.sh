@@ -125,9 +125,11 @@ _mn_pd_window() {
   while IFS='=' read -r _role _url; do
     [ -n "$_url" ] || continue
     mkdir -p "$PROFILE_DIR/$_role"
-    if curl -sf -X POST "${_url}/start_profile" -H 'Content-Type: application/json' \
-        -d "{\"output_dir\":\"${PROFILE_DIR}/${_role}\",\"num_steps\":${PROFILE_NUM_STEPS},\"record_shapes\":true,\"with_stack\":${_stack},\"activities\":${_acts}}" \
-        >/dev/null 2>&1; then
+    # ATOM takes no request body: its output dir is fixed at launch (mn.py gives each role its
+    # own ATOM_TORCH_PROFILER_DIR) and the window is closed by /stop_profile, not by a step count.
+    local _body=(-H 'Content-Type: application/json' -d "{\"output_dir\":\"${PROFILE_DIR}/${_role}\",\"num_steps\":${PROFILE_NUM_STEPS},\"record_shapes\":true,\"with_stack\":${_stack},\"activities\":${_acts}}")
+    [ "${BACKEND:-}" = "atom" ] && _body=()
+    if curl -sf -X POST "${_url}/start_profile" ${_body[@]+"${_body[@]}"} >/dev/null 2>&1; then
       _windowed="${_windowed}${_role}=${_url}"$'\n'
     else
       echo "!!! multinode: /start_profile failed on the $_role engine ($_url)" >&2
@@ -205,6 +207,8 @@ adapter_profile_window() {
   local _expect="$TP"
   local _before _after _deadline _depth=1 _windowed=""
   [ "$_MN_TOPOLOGY" = "pd_disagg" ] && _depth=2
+  # ATOM: <profile>/<role>/rank_<N>/<trace>, one directory deeper than sglang's.
+  [ "${BACKEND:-}" = "atom" ] && _depth=$(( _depth + 1 ))
   _mn_traces() { find "$PROFILE_DIR" -maxdepth "$_depth" -name '*.trace.json*' "$@" 2>/dev/null; }
   _before=$(_mn_traces | wc -l)
 
