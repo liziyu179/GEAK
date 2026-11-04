@@ -891,3 +891,54 @@ returns `error_class: multinode_check_refused` with the problems listed. GPU ide
 is read from the nodes, not the driver. The full contract, the environment reference
 and the failure table are in
 [`e2e_workflow/docs/multi_node.md`](../e2e_workflow/docs/multi_node.md).
+
+### Atomesh launcher (`BENCH_LAUNCHER=atomesh`)
+
+`BACKEND=atom BENCH_LAUNCHER=atomesh` measures a whole single-node Atomesh deployment as
+**one** server: N ATOM workers behind an `atomesh launch` router, or P prefill and D decode
+workers behind a P/D router. The router listens on `$PORT`, so `$BASE_URL`, the bench client,
+the summary and the acceptance contract are the single-server ones. Only `adapter_launch` and
+`adapter_profile_window` are redefined (`adapters/launchers/atomesh.sh`); health, bench and
+the measurement-ready check are `atom.sh`'s.
+
+The topology comes from GEAK's own knobs: the `GPU` list is cut into `TP`-sized chunks and each
+chunk is one worker (`GPU=0,1,2,3 TP=1` is four workers; `TP=2` is two TP2 workers).
+
+| variable | default | |
+| --- | --- | --- |
+| `ATOMESH_MODE` | `regular` | `regular`, or `pd` |
+| `ATOMESH_POLICY` | `round_robin` | the router policy in regular mode |
+| `ATOMESH_PREFILL_COUNT` | `1` | pd: how many leading chunks are prefill workers |
+| `ATOMESH_PREFILL_POLICY` / `ATOMESH_DECODE_POLICY` | `round_robin` | the pd router's policies |
+| `ATOMESH_PROFILE_WORKER` | `worker-0` (`decode-0` in pd) | the worker that serves `PROFILE=1` |
+| `ATOMESH_ROUTER_ARGS` | | extra raw `atomesh launch` flags |
+| `ATOMESH_WORKER_PORT_BASE` | `PORT+2000` | the first worker's HTTP port; worker `i` uses `+10*i` |
+
+They may also arrive inside `EXTRA_ENV`, which is how the Config Tuner can sweep the router
+policy; the launcher consumes them and does not forward them to the workers.
+
+Optimizations reach **every** worker: `EXTRA_SERVER_ARGS` and `EXTRA_ENV` on each worker's
+command line and environment, `OVERLAY_PYTHONPATH` prepended to each worker's `PYTHONPATH`. The
+router receives none of them.
+
+One `setsid` supervisor owns every component, so the dispatcher's process-group teardown reaps
+the whole mesh. It starts worker 0 alone first (cold workers of one deployment race on the shared
+`~/.cache/atom` compile cache), then the others, then the router. It fails the leg as soon as a
+component exits or a worker's log shows an engine-core failure: an ATOM api server keeps answering
+`/health` after its engine core has died, so waiting for a timeout would hang.
+
+`PROFILE=1` opens the torch profiler on one worker, because the router does not proxy
+`/start_profile`.
+
+To optimize a mesh with the workflow, export `BENCH_LAUNCHER=atomesh` (and any `ATOMESH_*`) in the
+shell that starts it, and pass `backend: atom`, `tp` (per worker), `serving_gpu` (every serving GPU)
+and `gpu_ids` (the GPUs for kernel work, disjoint from `serving_gpu`). Four TP1 workers:
+
+```json
+{"backend": "atom", "tp": 1, "serving_gpu": "0,1,2,3", "gpu_ids": "4,5,6,7",
+ "model_path": "<model dir>", "isl": 1024, "osl": 256, "conc": 128,
+ "exp_root": "<dir>", "time_budget_s": 43200}
+```
+
+Limits: one node. pd runs Mooncake over TCP because one node has no RDMA, so it checks that the
+topology can be driven and says nothing about P/D performance.
